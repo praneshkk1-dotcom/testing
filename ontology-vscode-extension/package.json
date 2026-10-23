@@ -1,0 +1,352 @@
+{
+  "name": "ontocode-studio",
+  "displayName": "OntoCode Studio",
+  "description": "Edit, query and reason over OWL/RDF ontologies: SPARQL, reasoner, graph view, AI-assisted edits with undo and team collaboration. Free plan, no card.",
+  "version": "1.2.6",
+  "publisher": "SelfResearchInstitute",
+  "license": "AGPL-3.0-only",
+  "icon": "images/icon.png",
+  "homepage": "https://ontocode.selfresearch.org",
+  "bugs": {
+    "url": "https://ontocode.selfresearch.org/report-bug"
+  },
+  "galleryBanner": {
+    "color": "#1e1b4b",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Visualization",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "owl",
+    "ontology",
+    "rdf",
+    "turtle",
+    "sparql",
+    "reasoner",
+    "hermit",
+    "swrl",
+    "semantic web",
+    "knowledge graph"
+  ],
+  "activationEvents": [
+    "onCommand:ontocode.edit",
+    "onCommand:ontocode.editLargeFile",
+    "onCommand:ontocode.logout",
+    "onCommand:ontocode.insertCitation",
+    "onCommand:ontocode.showCollaborationStatus",
+    "onView:ontocode.sidebarView",
+    "onLanguage:owl",
+    "onUri"
+  ],
+  "main": "./dist/extension.js",
+  "browser": "./dist/web/extension.js",
+  "contributes": {
+    "webviews": [
+      {
+        "viewType": "ontocodeEditor",
+        "displayName": "OntoCode Studio Editor",
+        "when": "true"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ontocodeSidebar",
+          "title": "OntoCode Studio",
+          "icon": "images/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ontocodeSidebar": [
+        {
+          "id": "ontocode.sidebarView",
+          "name": "OntoCode Studio",
+          "icon": "images/sidebar-icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ontocode.refreshSidebar",
+        "title": "OntoCode Studio: Refresh Sidebar",
+        "category": "OntoCode Studio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ontocode.edit",
+        "title": "Edit with OntoCode Studio",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.editLargeFile",
+        "title": "OntoCode Studio: Edit Ontology File",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.logout",
+        "title": "OntoCode Studio: Logout",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.insertCitation",
+        "title": "Insert Citation (Sci2Code)",
+        "category": "OntoCode Studio",
+        "icon": "$(book)"
+      },
+      {
+        "command": "ontocode.showCollaborationStatus",
+        "title": "OntoCode Studio: Show Collaboration Status",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.configureZotero",
+        "title": "OntoCode Studio: Configure Zotero API Key",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.testZoteroConnection",
+        "title": "OntoCode Studio: Test Zotero Connection",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.testInvitationFlow",
+        "title": "OntoCode Studio: Test Invitation Flow",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.openWebview",
+        "title": "Open OntoCode Editor",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.undo",
+        "title": "Undo my last ontology change",
+        "category": "OntoCode Studio"
+      },
+      {
+        "command": "ontocode.redo",
+        "title": "Redo ontology change",
+        "category": "OntoCode Studio"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "ontocode.sidebarView",
+        "contents": "Edit OWL, TTL, and RDF ontologies with AI assistance.\n[Open OntoCode Editor](command:ontocode.openWebview)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ontocode.edit",
+          "when": "resourceLangId == owl"
+        },
+        {
+          "command": "ontocode.editLargeFile",
+          "when": "resourceLangId == owl"
+        },
+        {
+          "command": "ontocode.undo",
+          "when": "false"
+        },
+        {
+          "command": "ontocode.redo",
+          "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ontocode.insertCitation",
+          "when": "resourceExtname =~ /\\.(owl|ttl|rdf|n3|jsonld)$/",
+          "group": "ontocode"
+        },
+        {
+          "command": "ontocode.editLargeFile",
+          "when": "resourceFilename =~ /\\.(owl|ttl|rdf)$/i",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "ontocode.insertCitation",
+          "when": "resourceExtname =~ /\\.(owl|ttl|rdf|n3|jsonld)$/",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "ontocode.refreshSidebar",
+          "when": "view == ontocode.sidebarView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "ontocode.insertCitation",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "editorTextFocus && resourceExtname =~ /\\.(owl|ttl|rdf|n3|jsonld)$/"
+      },
+      {
+        "command": "ontocode.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "activeWebviewPanelId == 'ontocodeEditor' && ontocode.ontologyFocus"
+      },
+      {
+        "command": "ontocode.redo",
+        "key": "ctrl+y",
+        "when": "activeWebviewPanelId == 'ontocodeEditor' && ontocode.ontologyFocus"
+      },
+      {
+        "command": "ontocode.redo",
+        "key": "ctrl+shift+z",
+        "mac": "cmd+shift+z",
+        "when": "activeWebviewPanelId == 'ontocodeEditor' && ontocode.ontologyFocus"
+      }
+    ],
+    "languages": [
+      {
+        "id": "owl",
+        "aliases": [
+          "OWL",
+          "owl"
+        ],
+        "extensions": [
+          ".owl"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "jsonld",
+        "aliases": [
+          "JSON-LD",
+          "jsonld"
+        ],
+        "extensions": [
+          ".jsonld"
+        ],
+        "mimetypes": [
+          "application/ld+json"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "OntoCode Studio",
+      "properties": {
+        "ontocode.zotero.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Citation library API key",
+          "markdownDescription": "Citation library API key used for reference lookup"
+        },
+        "ontocode.zotero.userId": {
+          "type": "string",
+          "default": "",
+          "description": "Citation library user ID",
+          "markdownDescription": "Citation library user ID used for reference lookup"
+        },
+        "ontocode.zotero.libraryType": {
+          "type": "string",
+          "enum": [
+            "user",
+            "group"
+          ],
+          "default": "user",
+          "description": "Citation library type (user or group)"
+        },
+        "ontocode.zotero.groupId": {
+          "type": "string",
+          "default": "",
+          "description": "Group ID if using a group citation library"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run bundle:extension",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "node ./out/test/runTest.js",
+    "build-webview": "cd webview-src && npm run build:vscode",
+    "compile-web": "webpack --config webpack.config.js --mode development --watch",
+    "test-web": "npm run bundle:web && vscode-test-web --browserType=chromium --extensionDevelopmentPath=./ ./workspace",
+    "test-web:server": "npm run bundle:web && vscode-test-web --browserType=none --port=3000 --host=0.0.0.0 --extensionDevelopmentPath=./ ./workspace",
+    "test-web:dev": "vscode-test-web --browserType=chromium --port=3000 --extensionDevelopmentPath=./ ./workspace",
+    "dev-webview": "cd webview-src && npm run dev",
+    "bundle:extension": "webpack --config webpack.extension.js --mode production",
+    "bundle:webview": "cd webview-src && npm run build:vscode",
+    "bundle:web": "webpack --config webpack.config.js --mode production",
+    "bundle:all": "npm run bundle:webview && npm run bundle:extension && npm run bundle:web",
+    "test:selfhosted": "cross-env ENV_FILE=.env.selfhosted-test npm run bundle:all",
+    "test:cloud": "cross-env ENV_FILE=.env.cloud-test npm run bundle:all",
+    "analyze:extension": "cross-env ANALYZE=true webpack --config webpack.extension.js --mode production",
+    "analyze:web": "cross-env ANALYZE=true webpack --config webpack.config.js --mode production",
+    "check:size": "node scripts/check-bundle-size.js",
+    "package": "vsce package",
+    "package:check": "vsce package && node -e \"const fs=require('fs');const files=fs.readdirSync('.');const vsix=files.find(f=>f.endsWith('.vsix'));if(vsix){const stats=fs.statSync(vsix);const mb=(stats.size/(1024*1024)).toFixed(2);console.log(`\\n📦 VSIX Size: ${mb} MB (${stats.size.toLocaleString()} bytes)`);console.log(`⚠️  Default limit: 25 MB`);console.log(`🔴 Hard limit: 50 MB\\n`);if(stats.size>50*1024*1024)console.log('❌ EXCEEDS HARD LIMIT!');else if(stats.size>25*1024*1024)console.log('⚠️  EXCEEDS DEFAULT LIMIT');}else{console.log('No .vsix file found');}\""
+  },
+  "devDependencies": {
+    "@types/form-data": "^2.2.1",
+    "@types/node": "16.x",
+    "@types/sockjs-client": "^1.5.4",
+    "@types/vscode": "^1.74.0",
+    "@types/ws": "^8.5.13",
+    "@typescript-eslint/eslint-plugin": "^5.45.0",
+    "@typescript-eslint/parser": "^5.45.0",
+    "@vscode/test-web": "^0.0.80",
+    "@vscode/vsce": "^3.9.2",
+    "assert": "^2.1.0",
+    "buffer": "^6.0.3",
+    "copy-webpack-plugin": "^14.0.0",
+    "cross-env": "^10.1.0",
+    "crypto-browserify": "^3.12.1",
+    "css-loader": "^7.1.2",
+    "css-minimizer-webpack-plugin": "^8.0.0",
+    "eslint": "^8.28.0",
+    "html-webpack-plugin": "^5.6.5",
+    "https-browserify": "^1.0.0",
+    "mini-css-extract-plugin": "^2.9.4",
+    "pako": "^2.1.0",
+    "process": "^0.11.10",
+    "readable-stream": "^2.3.8",
+    "stream-browserify": "^3.0.0",
+    "stream-http": "^3.2.0",
+    "style-loader": "^4.0.0",
+    "terser-webpack-plugin": "^5.3.16",
+    "ts-loader": "^9.5.4",
+    "typescript": "^4.9.4",
+    "url": "^0.11.4",
+    "util": "^0.12.5",
+    "webpack": "^5.103.0",
+    "webpack-bundle-analyzer": "^5.0.1",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "@stomp/stompjs": "^7.0.0",
+    "axios": "^1.13.6",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.5",
+    "fs-extra": "^11.1.0",
+    "lucide-react": "^0.525.0",
+    "path-browserify": "^1.0.1",
+    "sockjs-client": "^1.6.1",
+    "ws": "^8.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/The-Self-Research-Institute/ontocode.git"
+  }
+}

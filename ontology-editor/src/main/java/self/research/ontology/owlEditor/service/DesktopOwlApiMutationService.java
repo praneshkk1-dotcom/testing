@@ -1,0 +1,122 @@
+package self.research.ontology.owlEditor.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Conditional;
+import org.springframework.lang.Nullable;
+import org.springframework.stereotype.Service;
+import self.research.ontology.owlEditor.cache.ProjectOntologyCache;
+import self.research.ontology.owlEditor.config.FastOpenCondition;
+
+import java.io.IOException;
+import java.util.List;
+
+@Service
+@Conditional(FastOpenCondition.class)
+public class DesktopOwlApiMutationService {
+
+    private static final Logger log = LoggerFactory.getLogger(DesktopOwlApiMutationService.class);
+
+    private final ProjectOntologyCache ontologyCache;
+    private final OwlApiMutationPatcher patcher;
+    private final InMemorySparqlOntologyMutator sparqlMutator;
+    private final StorageManager storageManager;
+    @Nullable
+    private final DesktopOntologyLoader desktopOntologyLoader;
+    @Nullable
+    private final ProjectImportService projectImportService;
+
+    @Nullable
+    private final DesktopFusekiSyncScheduler fusekiSyncScheduler;
+
+    @Value("${ontocode.desktop.owlapi-first:false}")
+    private boolean owlApiFirst;
+
+    public DesktopOwlApiMutationService(ProjectOntologyCache ontologyCache,
+                                        OwlApiMutationPatcher patcher,
+                                        InMemorySparqlOntologyMutator sparqlMutator,
+                                        StorageManager storageManager,
+                                        @Nullable DesktopOntologyLoader desktopOntologyLoader,
+                                        @Nullable ProjectImportService projectImportService,
+                                        @Nullable DesktopFusekiSyncScheduler fusekiSyncScheduler) {
+        this.ontologyCache = ontologyCache;
+        this.patcher = patcher;
+        this.sparqlMutator = sparqlMutator;
+        this.storageManager = storageManager;
+        this.desktopOntologyLoader = desktopOntologyLoader;
+        this.projectImportService = projectImportService;
+        this.fusekiSyncScheduler = fusekiSyncScheduler;
+    }
+
+    public boolean isAuthoritative(String projectId) {
+        return owlApiFirst && ontologyCache.has(projectId);
+    }
+
+    public boolean exportLiveModel(String projectId, java.nio.file.Path target) {
+        if (!isAuthoritative(projectId)) {
+            return false;
+        }
+        return ontologyCache.get(projectId).map(entry -> {
+            try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(target)) {
+                entry.manager().saveOntology(entry.ontology(), new org.semanticweb.owlapi.formats.RDFXMLDocumentFormat(), out);
+                return true;
+            } catch (Exception e) {
+                log.warn("[OwlApiDesktop] Could not export the live model for {}: {}", projectId, e.getMessage());
+                return false;
+            }
+        }).orElse(false);
+    }
+
+    public java.util.Optional<Boolean> declaresEntity(String projectId, String iri) {
+        if (!isAuthoritative(projectId)) {
+            return java.util.Optional.empty();
+        }
+        return ontologyCache.get(projectId).map(entry -> entry.ontology().containsEntityInSignature(
+                org.semanticweb.owlapi.model.IRI.create(iri), org.semanticweb.owlapi.model.parameters.Imports.INCLUDED));
+    }
+
+    public boolean tryApply(String projectId, List<OntologyMutationService.MutationOp> ops, String sparqlUpdate) {
+        if (!owlApiFirst || ops == null || ops.isEmpty() || !ontologyCache.has(projectId)) {
+            return false;
+        }
+
+        boolean patched = patcher.tryPatch(projectId, ops);
+        if (!patched) {
+            patched = sparqlMutator.tryApply(projectId, sparqlUpdate);
+        }
+        if (!patched) {
+            return false;
+        }
+        return afterApplied(projectId);
+    }
+
+    public boolean tryApplyRaw(String projectId, String sparqlUpdate) {
+        if (!owlApiFirst || sparqlUpdate == null || sparqlUpdate.isBlank() || !ontologyCache.has(projectId)) {
+            return false;
+        }
+        return sparqlMutator.tryApply(projectId, sparqlUpdate) && afterApplied(projectId);
+    }
+
+    private boolean afterApplied(String projectId) {
+        try {
+            if (desktopOntologyLoader != null) {
+                desktopOntologyLoader.persistToDisk(projectId);
+            }
+            if (projectImportService != null) {
+                projectImportService.markFusekiSyncPendingPublic(projectId);
+            }
+            if (fusekiSyncScheduler != null) {
+                fusekiSyncScheduler.scheduleAfterMutation(projectId);
+            }
+
+            storageManager.clearCodeViewCache(projectId);
+        } catch (IOException e) {
+            log.warn("[OwlApiDesktop] Persist after mutation failed for {}: {}", projectId, e.getMessage());
+            return false;
+        }
+
+        log.info("[OwlApiDesktop] Mutation applied via OWLAPI for project={} (Fuseki sync deferred)", projectId);
+        return true;
+    }
+}

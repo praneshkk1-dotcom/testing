@@ -1,0 +1,782 @@
+package self.research.ontology.owlEditor.model;
+
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
+import org.springframework.data.mongodb.core.index.CompoundIndexes;
+import org.springframework.data.mongodb.core.index.Indexed;
+
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Represents a change synced from GraphDB history to MongoDB.
+ * This enables full feature support (approve, reject, comments) for GraphDB changes.
+ */
+@Document(collection = "history_changes")
+@CompoundIndexes({
+    @CompoundIndex(name = "project_draft_user_ts", def = "{'projectId': 1, 'draft': 1, 'userId': 1, 'timestamp': -1}"),
+    @CompoundIndex(name = "project_entity_ts", def = "{'projectId': 1, 'entityIRI': 1, 'timestamp': -1}")
+})
+public class HistoryChange {
+
+    @Id
+    private String id;
+
+    @Indexed
+    private String projectId;
+
+    @Indexed
+    private String editId; // The GraphDB edit IRI for deduplication
+
+    @Indexed
+    private String userId;
+    
+    private String username;
+
+    @Indexed
+    private LocalDateTime timestamp;
+
+    private String operationType; // ADD, REMOVE, MODIFY
+    
+    private String entityType; // CLASS, PROPERTY, INDIVIDUAL, ANNOTATION, AXIOM
+    
+    private String entityIRI;
+    
+    private String entityLabel;
+    
+    // Change details from GraphDB
+    private String oldValue;
+    private String newValue;
+    private String annotationProperty; // For annotation changes, the property IRI
+    
+    private String description;
+    
+    // Collaboration features
+    private String status = "SAVED";
+    private String approvedBy;
+    private LocalDateTime approvedAt;
+    private String rejectedBy;
+    private LocalDateTime rejectedAt;
+    
+    // Comments
+    private Map<String, CommentEntry> comments = new HashMap<>();
+    
+    // Conflict resolution
+    private boolean hasConflict = false;
+    private String conflictResolution;
+    private String resolvedBy;
+    private LocalDateTime resolvedAt;
+    
+    // Metadata from GraphDB
+    private Map<String, String> metadata = new HashMap<>();
+
+    private List<SubChange> subChanges = new ArrayList<>();
+
+    private boolean draft = false;
+
+    // Rollback tracking (whole-entry rollback)
+    private boolean reverted = false;
+    private String revertedAuditId;
+
+    @Indexed
+    private String changeSetId;
+    private String exactDeleted;
+    private String exactInserted;
+    private String coveredBy;
+    private int exactCovers;
+    private String documentStore;
+    private String undoBlockedReason;
+    private String operationGroupId;
+    private String documentId;
+    private String documentBefore;
+    private String documentAfter;
+    private String source;
+    private AiInfo ai;
+
+    // Sync tracking
+    private LocalDateTime syncedAt;
+
+    public static class SubChange {
+        private String id;
+        private String predicate;
+        private String oldValue;
+        private String newValue;
+        private String annotationProperty;
+        private String category;
+        private String language;
+        private String datatype;
+        private boolean addition;
+
+        // Rollback tracking (granular rollback of this sub-change alone)
+        private boolean reverted;
+        private String revertedAuditId;
+
+        public SubChange() {
+        }
+
+        public SubChange(String predicate, String oldValue, String newValue, String annotationProperty, boolean addition) {
+            this.predicate = predicate;
+            this.oldValue = oldValue;
+            this.newValue = newValue;
+            this.annotationProperty = annotationProperty;
+            this.addition = addition;
+        }
+
+        public String getId() {
+            return id;
+        }
+
+        public void setId(String id) {
+            this.id = id;
+        }
+
+        public boolean isReverted() {
+            return reverted;
+        }
+
+        public void setReverted(boolean reverted) {
+            this.reverted = reverted;
+        }
+
+        public String getRevertedAuditId() {
+            return revertedAuditId;
+        }
+
+        public void setRevertedAuditId(String revertedAuditId) {
+            this.revertedAuditId = revertedAuditId;
+        }
+
+        public String getPredicate() {
+            return predicate;
+        }
+
+        public void setPredicate(String predicate) {
+            this.predicate = predicate;
+        }
+
+        public String getOldValue() {
+            return oldValue;
+        }
+
+        public void setOldValue(String oldValue) {
+            this.oldValue = oldValue;
+        }
+
+        public String getNewValue() {
+            return newValue;
+        }
+
+        public void setNewValue(String newValue) {
+            this.newValue = newValue;
+        }
+
+        public String getAnnotationProperty() {
+            return annotationProperty;
+        }
+
+        public void setAnnotationProperty(String annotationProperty) {
+            this.annotationProperty = annotationProperty;
+        }
+
+        public String getLanguage() {
+            return language;
+        }
+
+        public void setLanguage(String language) {
+            this.language = language;
+        }
+
+        public String getDatatype() {
+            return datatype;
+        }
+
+        public void setDatatype(String datatype) {
+            this.datatype = datatype;
+        }
+
+        public String getCategory() {
+            return category;
+        }
+
+        public void setCategory(String category) {
+            this.category = category;
+        }
+
+        public boolean isAddition() {
+            return addition;
+        }
+
+        public void setAddition(boolean addition) {
+            this.addition = addition;
+        }
+    }
+
+    public static class CommentEntry {
+        private String userId;
+        private String username;
+        private String text;
+        private LocalDateTime timestamp;
+        
+        public CommentEntry() {
+            this.timestamp = LocalDateTime.now(ZoneOffset.UTC);
+        }
+        
+        public CommentEntry(String userId, String username, String text) {
+            this();
+            this.userId = userId;
+            this.username = username;
+            this.text = text;
+        }
+
+        // Getters and Setters
+        public String getUserId() {
+            return userId;
+        }
+
+        public void setUserId(String userId) {
+            this.userId = userId;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getText() {
+            return text;
+        }
+
+        public void setText(String text) {
+            this.text = text;
+        }
+
+        public LocalDateTime getTimestamp() {
+            return timestamp;
+        }
+
+        public void setTimestamp(LocalDateTime timestamp) {
+            this.timestamp = timestamp;
+        }
+
+        public String getTimestampIso() {
+            return timestamp == null ? null : timestamp.toInstant(ZoneOffset.UTC).toString();
+        }
+    }
+
+    // Constructors
+    public HistoryChange() {
+        this.timestamp = LocalDateTime.now(ZoneOffset.UTC);
+        this.syncedAt = LocalDateTime.now(ZoneOffset.UTC);
+    }
+
+    public HistoryChange(String projectId, String editId, String userId, String username) {
+        this();
+        this.projectId = projectId;
+        this.editId = editId;
+        this.userId = userId;
+        this.username = username;
+    }
+
+    // Builder pattern
+    public static class AiInfo {
+        private String provider;
+        private String model;
+        private String sessionId;
+        private String groupId;
+        private String summary;
+
+        public AiInfo() {
+        }
+
+        public AiInfo(String provider, String model, String sessionId, String groupId, String summary) {
+            this.provider = provider;
+            this.model = model;
+            this.sessionId = sessionId;
+            this.groupId = groupId;
+            this.summary = summary;
+        }
+
+        public String getProvider() { return provider; }
+        public void setProvider(String provider) { this.provider = provider; }
+        public String getModel() { return model; }
+        public void setModel(String model) { this.model = model; }
+        public String getSessionId() { return sessionId; }
+        public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+        public String getGroupId() { return groupId; }
+        public void setGroupId(String groupId) { this.groupId = groupId; }
+        public String getSummary() { return summary; }
+        public void setSummary(String summary) { this.summary = summary; }
+    }
+
+    public static class Builder {
+        private HistoryChange change;
+
+        public Builder(String projectId, String editId, String userId, String username) {
+            change = new HistoryChange(projectId, editId, userId, username);
+        }
+
+        public Builder operationType(String operationType) {
+            change.operationType = operationType;
+            return this;
+        }
+
+        public Builder entityType(String entityType) {
+            change.entityType = entityType;
+            return this;
+        }
+
+        public Builder entityIRI(String iri) {
+            change.entityIRI = iri;
+            return this;
+        }
+
+        public Builder entityLabel(String label) {
+            change.entityLabel = label;
+            return this;
+        }
+
+        public Builder oldValue(String oldValue) {
+            change.oldValue = oldValue;
+            return this;
+        }
+
+        public Builder newValue(String newValue) {
+            change.newValue = newValue;
+            return this;
+        }
+
+        public Builder annotationProperty(String annotationProperty) {
+            change.annotationProperty = annotationProperty;
+            return this;
+        }
+
+        public Builder description(String description) {
+            change.description = description;
+            return this;
+        }
+
+        public Builder timestamp(LocalDateTime timestamp) {
+            change.timestamp = timestamp;
+            return this;
+        }
+
+        public Builder metadata(String key, String value) {
+            change.metadata.put(key, value);
+            return this;
+        }
+
+        public Builder subChanges(List<SubChange> subChanges) {
+            if (subChanges != null) {
+                change.subChanges = subChanges;
+            }
+            return this;
+        }
+
+        public Builder draft(boolean draft) {
+            change.draft = draft;
+            return this;
+        }
+
+        public Builder changeSetId(String changeSetId) {
+            change.changeSetId = changeSetId;
+            return this;
+        }
+
+        public Builder source(String source) {
+            change.source = source;
+            return this;
+        }
+
+        public Builder ai(AiInfo ai) {
+            change.ai = ai;
+            return this;
+        }
+
+        public HistoryChange build() {
+            return change;
+        }
+    }
+
+    // Getters and Setters
+    public String getId() {
+        return id;
+    }
+
+    public void setId(String id) {
+        this.id = id;
+    }
+
+    public String getProjectId() {
+        return projectId;
+    }
+
+    public void setProjectId(String projectId) {
+        this.projectId = projectId;
+    }
+
+    public String getEditId() {
+        return editId;
+    }
+
+    public void setEditId(String editId) {
+        this.editId = editId;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public LocalDateTime getTimestamp() {
+        return timestamp;
+    }
+
+    public void setTimestamp(LocalDateTime timestamp) {
+        this.timestamp = timestamp;
+    }
+
+    public String getTimestampIso() {
+        return timestamp == null ? null : timestamp.toInstant(ZoneOffset.UTC).toString();
+    }
+
+    public String getOperationType() {
+        return operationType;
+    }
+
+    public void setOperationType(String operationType) {
+        this.operationType = operationType;
+    }
+
+    public String getEntityType() {
+        return entityType;
+    }
+
+    public void setEntityType(String entityType) {
+        this.entityType = entityType;
+    }
+
+    public String getEntityIRI() {
+        return entityIRI;
+    }
+
+    public void setEntityIRI(String entityIRI) {
+        this.entityIRI = entityIRI;
+    }
+
+    public String getEntityLabel() {
+        return entityLabel;
+    }
+
+    public void setEntityLabel(String entityLabel) {
+        this.entityLabel = entityLabel;
+    }
+
+    public String getOldValue() {
+        return oldValue;
+    }
+
+    public void setOldValue(String oldValue) {
+        this.oldValue = oldValue;
+    }
+
+    public String getNewValue() {
+        return newValue;
+    }
+
+    public void setNewValue(String newValue) {
+        this.newValue = newValue;
+    }
+
+    public String getAnnotationProperty() {
+        return annotationProperty;
+    }
+
+    public void setAnnotationProperty(String annotationProperty) {
+        this.annotationProperty = annotationProperty;
+    }
+
+    public String getDescription() {
+        return description;
+    }
+
+    public void setDescription(String description) {
+        this.description = description;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public String getApprovedBy() {
+        return approvedBy;
+    }
+
+    public void setApprovedBy(String approvedBy) {
+        this.approvedBy = approvedBy;
+    }
+
+    public LocalDateTime getApprovedAt() {
+        return approvedAt;
+    }
+
+    public void setApprovedAt(LocalDateTime approvedAt) {
+        this.approvedAt = approvedAt;
+    }
+
+    public String getApprovedAtIso() {
+        return approvedAt == null ? null : approvedAt.toInstant(ZoneOffset.UTC).toString();
+    }
+
+    public String getRejectedBy() {
+        return rejectedBy;
+    }
+
+    public void setRejectedBy(String rejectedBy) {
+        this.rejectedBy = rejectedBy;
+    }
+
+    public LocalDateTime getRejectedAt() {
+        return rejectedAt;
+    }
+
+    public void setRejectedAt(LocalDateTime rejectedAt) {
+        this.rejectedAt = rejectedAt;
+    }
+
+    public String getRejectedAtIso() {
+        return rejectedAt == null ? null : rejectedAt.toInstant(ZoneOffset.UTC).toString();
+    }
+
+    public Map<String, CommentEntry> getComments() {
+        return comments;
+    }
+
+    public void setComments(Map<String, CommentEntry> comments) {
+        this.comments = comments;
+    }
+
+    public boolean isHasConflict() {
+        return hasConflict;
+    }
+
+    public void setHasConflict(boolean hasConflict) {
+        this.hasConflict = hasConflict;
+    }
+
+    public String getConflictResolution() {
+        return conflictResolution;
+    }
+
+    public void setConflictResolution(String conflictResolution) {
+        this.conflictResolution = conflictResolution;
+    }
+
+    public String getResolvedBy() {
+        return resolvedBy;
+    }
+
+    public void setResolvedBy(String resolvedBy) {
+        this.resolvedBy = resolvedBy;
+    }
+
+    public LocalDateTime getResolvedAt() {
+        return resolvedAt;
+    }
+
+    public void setResolvedAt(LocalDateTime resolvedAt) {
+        this.resolvedAt = resolvedAt;
+    }
+
+    public String getResolvedAtIso() {
+        return resolvedAt == null ? null : resolvedAt.toInstant(ZoneOffset.UTC).toString();
+    }
+
+    public Map<String, String> getMetadata() {
+        return metadata;
+    }
+
+    public void setMetadata(Map<String, String> metadata) {
+        this.metadata = metadata;
+    }
+
+    public List<SubChange> getSubChanges() {
+        return subChanges;
+    }
+
+    public void setSubChanges(List<SubChange> subChanges) {
+        this.subChanges = subChanges != null ? subChanges : new ArrayList<>();
+    }
+
+    public boolean isDraft() {
+        return draft;
+    }
+
+    public void setDraft(boolean draft) {
+        this.draft = draft;
+    }
+
+    public boolean isReverted() {
+        return reverted;
+    }
+
+    public String getChangeSetId() {
+        return changeSetId;
+    }
+
+    public void setChangeSetId(String changeSetId) {
+        this.changeSetId = changeSetId;
+    }
+
+    public String getSource() {
+        return source;
+    }
+
+    public void setSource(String source) {
+        this.source = source;
+    }
+
+    public AiInfo getAi() {
+        return ai;
+    }
+
+    public void setAi(AiInfo ai) {
+        this.ai = ai;
+    }
+
+    public void setReverted(boolean reverted) {
+        this.reverted = reverted;
+    }
+
+    public String getRevertedAuditId() {
+        return revertedAuditId;
+    }
+
+    public void setRevertedAuditId(String revertedAuditId) {
+        this.revertedAuditId = revertedAuditId;
+    }
+
+    public LocalDateTime getSyncedAt() {
+        return syncedAt;
+    }
+
+    public void setSyncedAt(LocalDateTime syncedAt) {
+        this.syncedAt = syncedAt;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getExactDeleted() {
+        return exactDeleted;
+    }
+
+    public void setExactDeleted(String exactDeleted) {
+        this.exactDeleted = exactDeleted;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getExactInserted() {
+        return exactInserted;
+    }
+
+    public void setExactInserted(String exactInserted) {
+        this.exactInserted = exactInserted;
+    }
+
+    public String getCoveredBy() {
+        return coveredBy;
+    }
+
+    public void setCoveredBy(String coveredBy) {
+        this.coveredBy = coveredBy;
+    }
+
+    public int getExactCovers() {
+        return exactCovers;
+    }
+
+    public void setExactCovers(int exactCovers) {
+        this.exactCovers = exactCovers;
+    }
+
+    public String getDocumentStore() {
+        return documentStore;
+    }
+
+    public void setDocumentStore(String documentStore) {
+        this.documentStore = documentStore;
+    }
+
+    public String getDocumentId() {
+        return documentId;
+    }
+
+    public void setDocumentId(String documentId) {
+        this.documentId = documentId;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getDocumentBefore() {
+        return documentBefore;
+    }
+
+    public void setDocumentBefore(String documentBefore) {
+        this.documentBefore = documentBefore;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getDocumentAfter() {
+        return documentAfter;
+    }
+
+    public void setDocumentAfter(String documentAfter) {
+        this.documentAfter = documentAfter;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public boolean carriesDocument() {
+        return documentStore != null && documentId != null;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getOperationGroupId() {
+        return operationGroupId;
+    }
+
+    public void setOperationGroupId(String operationGroupId) {
+        this.operationGroupId = operationGroupId;
+    }
+
+    public String getUndoBlockedReason() {
+        return undoBlockedReason;
+    }
+
+    public void setUndoBlockedReason(String undoBlockedReason) {
+        this.undoBlockedReason = undoBlockedReason;
+    }
+
+    public boolean carriesExactDelta() {
+        return exactDeleted != null || exactInserted != null;
+    }
+}

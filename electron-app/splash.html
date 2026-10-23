@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OntoCode Studio – Starting…</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+    overflow: hidden;
+    /* drag anywhere on the frameless window */
+    -webkit-app-region: drag;
+  }
+
+  .logo-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+
+  .logo-img {
+    width: 56px;
+    height: 56px;
+    border-radius: 14px;
+    box-shadow: 0 4px 24px rgba(59,130,246,0.4);
+    object-fit: contain;
+  }
+
+  .app-name {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #f8fafc;
+  }
+
+  .app-tagline {
+    font-size: 11px;
+    color: #64748b;
+    letter-spacing: 0.5px;
+  }
+
+  /* Step list */
+  .steps {
+    width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 16px;
+    -webkit-app-region: no-drag;
+  }
+
+  .step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    opacity: 0.4;
+    transition: opacity 0.3s ease;
+  }
+  .step.active, .step.done { opacity: 1; }
+
+  .step-icon {
+    width: 18px;
+    height: 18px;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .step-icon .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #334155;
+  }
+
+  .step-icon .spinner {
+    display: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid #334155;
+    border-top-color: #60a5fa;
+    animation: spin 0.8s linear infinite;
+  }
+  .step.active .step-icon .dot { display: none; }
+  .step.active .step-icon .spinner { display: block; }
+
+  .step-icon .check {
+    display: none;
+    color: #34d399;
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .step.done .step-icon .spinner,
+  .step.done .step-icon .dot { display: none; }
+  .step.done .step-icon .check { display: block; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .step-body { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .step-label { font-size: 13px; font-weight: 500; color: #e2e8f0; }
+  .step-detail {
+    font-size: 11px;
+    color: #64748b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Overall progress bar */
+  .progress-track {
+    width: 420px;
+    height: 4px;
+    background: #1e293b;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 18px;
+    -webkit-app-region: no-drag;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+    border-radius: 2px;
+    width: 2%;
+    transition: width 0.5s ease;
+  }
+
+  /* Log console */
+  .log-area {
+    width: 420px;
+    height: 76px;
+    background: #0a0f1e;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px 12px;
+    overflow-y: auto;
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.7;
+    -webkit-app-region: no-drag;
+  }
+
+  .log-line { display: flex; gap: 8px; }
+  .log-badge {
+    min-width: 34px;
+    text-align: right;
+    font-weight: 600;
+    font-size: 10px;
+    padding-top: 1px;
+  }
+  .log-badge.info  { color: #60a5fa; }
+  .log-badge.ok    { color: #34d399; }
+  .log-badge.warn  { color: #fbbf24; }
+  .log-badge.error { color: #f87171; }
+  .log-msg         { color: #94a3b8; }
+
+  .details-toggle {
+    font-size: 11px;
+    color: #475569;
+    cursor: pointer;
+    margin-bottom: 8px;
+    -webkit-app-region: no-drag;
+  }
+  .details-toggle:hover { color: #64748b; }
+  .meta-row {
+    width: 420px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #64748b;
+    margin-bottom: 8px;
+    -webkit-app-region: no-drag;
+  }
+  .note {
+    width: 420px;
+    display: none;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #cbd5e1;
+    background: #172554;
+    border: 1px solid #1e3a8a;
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    -webkit-app-region: no-drag;
+  }
+  .note.slow { background: #422006; border-color: #92400e; color: #fde68a; }
+  .tip {
+    width: 420px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #94a3b8;
+    margin-bottom: 10px;
+    min-height: 36px;
+    -webkit-app-region: no-drag;
+  }
+  .tip-text { flex: 1; transition: opacity 0.25s ease; }
+  .tip-text.fade { opacity: 0; }
+  .tip-btn {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    border-radius: 50%;
+    border: 1px solid #334155;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .tip-btn:hover { color: #e2e8f0; border-color: #64748b; }
+  .actions {
+    width: 420px;
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+    -webkit-app-region: no-drag;
+  }
+  .action-btn {
+    flex: 1;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #cbd5e1;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .action-btn:hover { background: #334155; }
+  .action-btn.danger:hover { background: #7f1d1d; border-color: #b91c1c; }
+</style>
+</head>
+<body>
+
+<div class="logo-area">
+  <img src="splash-logo.png" alt="OntoCode Studio" class="logo-img" width="56" height="56" />
+  <div class="app-name">OntoCode Studio</div>
+  <div class="app-tagline">DESKTOP EDITION</div>
+</div>
+
+<div class="steps" id="steps">
+  <div class="step" data-key="java">
+    <span class="step-icon"><span class="dot"></span><span class="spinner"></span><span class="check">&#10003;</span></span>
+    <span class="step-body">
+      <span class="step-label">Checking system</span>
+      <span class="step-detail"></span>
+    </span>
+  </div>
+  <div class="step" data-key="mongo">
+    <span class="step-icon"><span class="dot"></span><span class="spinner"></span><span class="check">&#10003;</span></span>
+    <span class="step-body">
+      <span class="step-label">Preparing workspace</span>
+      <span class="step-detail"></span>
+    </span>
+  </div>
+  <div class="step" data-key="backend">
+    <span class="step-icon"><span class="dot"></span><span class="spinner"></span><span class="check">&#10003;</span></span>
+    <span class="step-body">
+      <span class="step-label">Loading editor</span>
+      <span class="step-detail"></span>
+    </span>
+  </div>
+  <div class="step" data-key="ready">
+    <span class="step-icon"><span class="dot"></span><span class="spinner"></span><span class="check">&#10003;</span></span>
+    <span class="step-body">
+      <span class="step-label">Ready</span>
+      <span class="step-detail"></span>
+    </span>
+  </div>
+</div>
+
+<div class="progress-track">
+  <div class="progress-fill" id="bar"></div>
+</div>
+<div class="meta-row"><span id="phase">Starting up…</span><span id="elapsed">Elapsed 0:00</span></div>
+<div class="note" id="note"></div>
+<div class="tip">
+  <button class="tip-btn" id="tipPrev" aria-label="Previous tip">&#8249;</button>
+  <span class="tip-text" id="tipText"></span>
+  <button class="tip-btn" id="tipNext" aria-label="Next tip">&#8250;</button>
+</div>
+<div class="details-toggle" id="detailsToggle">Show details</div>
+<div class="log-area" id="log" style="display:none;"></div>
+<div class="actions">
+  <button class="action-btn danger" id="quitBtn">Quit</button>
+</div>
+
+<script>
+  const logEl = document.getElementById('log');
+  const barEl = document.getElementById('bar');
+
+  const stepEls = {};
+  document.querySelectorAll('.step').forEach(el => { stepEls[el.dataset.key] = el; });
+
+  const ORDER = ['java', 'mongo', 'backend', 'ready'];
+  const BASE_PCT = { java: 5, mongo: 15, backend: 30, ready: 100 };
+
+  let currentIndex = -1;
+  let backendTicks = 0;
+
+  function setDetail(key, text) {
+    const el = stepEls[key];
+    if (el) el.querySelector('.step-detail').textContent = text;
+  }
+
+  function activateStep(key) {
+    const idx = ORDER.indexOf(key);
+    if (idx < 0 || idx <= currentIndex) return;
+    // Mark every step up to (not including) this one as done, in case a
+    // milestone was skipped (e.g. dev mode jumps straight to "ready").
+    for (let i = 0; i <= currentIndex; i++) {
+      stepEls[ORDER[i]].classList.remove('active');
+      stepEls[ORDER[i]].classList.add('done');
+    }
+    currentIndex = idx;
+    stepEls[key].classList.add('active');
+    setProgress(BASE_PCT[key]);
+  }
+
+  function completeStep(key) {
+    activateStep(key);
+    stepEls[key].classList.remove('active');
+    stepEls[key].classList.add('done');
+  }
+
+  function setProgress(pct) {
+    barEl.style.width = Math.min(pct, 100) + '%';
+  }
+
+  function appendLog(level, msg) {
+    const line = document.createElement('div');
+    line.className = 'log-line';
+
+    const badge = document.createElement('span');
+    badge.className = `log-badge ${level}`;
+    badge.textContent = level.toUpperCase();
+
+    const text = document.createElement('span');
+    text.className = 'log-msg';
+    text.textContent = msg;
+
+    line.appendChild(badge);
+    line.appendChild(text);
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+
+    route(msg);
+  }
+
+  // Friendly, rotating messages shown while the editor loads — real Spring
+  // Boot milestones drive *when* these advance, but the text stays generic
+  // (no "Mongo repositories" / "Tomcat" jargon a non-technical user shouldn't
+  // need to see). The raw technical lines still land in the hidden details log.
+  const BACKEND_MESSAGES = [
+    'Loading ontology engine…',
+    'Preparing reasoner…',
+    'Setting up plugins…',
+    'Warming up your workspace…',
+    'Almost there…',
+  ];
+
+  function nudgeBackend() {
+    backendTicks += 1;
+    setProgress(Math.min(BASE_PCT.backend + backendTicks * 6, 88));
+    setDetail('backend', BACKEND_MESSAGES[Math.min(backendTicks - 1, BACKEND_MESSAGES.length - 1)]);
+  }
+
+  function route(msg) {
+    const m = msg.toLowerCase();
+
+    if (m.includes('checking java runtime')) { activateStep('java'); return; }
+    if (m.includes('java') && m.includes('detected')) { completeStep('java'); return; }
+
+    if (m.includes('dev mode') || m.includes('skipping bundled service startup')) {
+      // Dev mode: services run under Docker already — skip straight to ready.
+      completeStep('java'); completeStep('mongo'); completeStep('backend');
+      activateStep('ready');
+      return;
+    }
+
+    if (m.includes('starting mongodb')) { activateStep('mongo'); return; }
+    if (m.includes('mongodb ready on port')) { completeStep('mongo'); return; }
+
+    if (m.includes('starting desktop service')) { activateStep('backend'); setDetail('backend', BACKEND_MESSAGES[0]); return; }
+    if (m.includes('[desktop] still starting')) { nudgeBackend(); return; }
+    if (m.includes('bootstrapping spring data') || m.includes('tomcat initialized') || m.includes('root webapplicationcontext')) {
+      nudgeBackend();
+      return;
+    }
+    if (m.includes('desktop service ready on port')) { completeStep('backend'); activateStep('ready'); hideNote(); setPhase('Opening your workspace…'); return; }
+    if (m.includes('routing proxy ready on port')) { completeStep('ready'); setProgress(100); setPhase('Ready'); return; }
+  }
+  const noteEl = document.getElementById('note');
+  const phaseEl = document.getElementById('phase');
+  const elapsedEl = document.getElementById('elapsed');
+  const startedAt = Date.now();
+  const SLOW_AFTER_SECS = 150;
+  let slowShown = false;
+  function formatElapsed(secs) {
+    return Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
+  }
+  function setPhase(text) { phaseEl.textContent = text; }
+  function showNote(text, slow) {
+    noteEl.textContent = text;
+    noteEl.classList.toggle('slow', Boolean(slow));
+    noteEl.style.display = 'block';
+  }
+  function hideNote() {
+    if (!slowShown) noteEl.style.display = 'none';
+  }
+  setInterval(() => {
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    elapsedEl.textContent = 'Elapsed ' + formatElapsed(secs);
+    const ready = stepEls.ready.classList.contains('done');
+    if (!ready && !slowShown && secs >= SLOW_AFTER_SECS) {
+      slowShown = true;
+      showNote('This is taking longer than usual. The first start after installing can take a few minutes while antivirus scans the new files. If nothing moves for a long time, quit and try again.', true);
+    }
+  }, 1000);
+  const TIPS = [
+    'Your ontologies are stored on this computer; the editor runs its own private backend.',
+    'Code View lets you edit the ontology source (Turtle, RDF/XML) directly and syncs your changes back.',
+    'Ask AI proposes edits you review before they are applied, and each AI change set can be undone.',
+    'Every change is recorded in History, so you can review it or undo it later.',
+  ];
+  const tipTextEl = document.getElementById('tipText');
+  let tipIndex = Math.floor(Math.random() * TIPS.length);
+  let tipPausedUntil = 0;
+  function showTip(index) {
+    tipIndex = (index + TIPS.length) % TIPS.length;
+    tipTextEl.classList.add('fade');
+    setTimeout(() => {
+      tipTextEl.textContent = TIPS[tipIndex];
+      tipTextEl.classList.remove('fade');
+    }, 200);
+  }
+  tipTextEl.textContent = TIPS[tipIndex];
+  document.getElementById('tipPrev').addEventListener('click', () => { tipPausedUntil = Date.now() + 20000; showTip(tipIndex - 1); });
+  document.getElementById('tipNext').addEventListener('click', () => { tipPausedUntil = Date.now() + 20000; showTip(tipIndex + 1); });
+  setInterval(() => { if (Date.now() > tipPausedUntil) showTip(tipIndex + 1); }, 8000);
+  const quitBtn = document.getElementById('quitBtn');
+  let quitArmed = false;
+  quitBtn.addEventListener('click', () => {
+    if (!quitArmed) {
+      quitArmed = true;
+      quitBtn.textContent = 'Click again to quit';
+      setTimeout(() => { quitArmed = false; quitBtn.textContent = 'Quit'; }, 3000);
+      return;
+    }
+    quitBtn.disabled = true;
+    quitBtn.textContent = 'Quitting…';
+    if (window.splashBridge) window.splashBridge.quit();
+  });
+
+  const toggleEl = document.getElementById('detailsToggle');
+  toggleEl.addEventListener('click', () => {
+    const showing = logEl.style.display !== 'none';
+    logEl.style.display = showing ? 'none' : 'block';
+    toggleEl.textContent = showing ? 'Show details' : 'Hide details';
+  });
+
+  // Receive log events from the main process via the splash-preload bridge
+  if (window.splashBridge) {
+    window.splashBridge.onLog((level, msg) => appendLog(level, msg));
+  }
+
+  // Seed with an initial message
+  appendLog('info', 'Starting OntoCode Studio…');
+</script>
+</body>
+</html>
