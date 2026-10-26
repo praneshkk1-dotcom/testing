@@ -1,0 +1,2077 @@
+package self.research.ontology.owlEditor.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.lang.Nullable;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+import org.eclipse.rdf4j.query.TupleQueryResult;
+import org.eclipse.rdf4j.query.BindingSet;
+import self.research.ontology.owlEditor.cache.ProjectOntologyCache;
+import self.research.ontology.owlEditor.controller.VisualizationController;
+
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.Set;
+
+@Service
+public class OntologyMutationService {
+
+    private static final Logger log = LoggerFactory.getLogger(OntologyMutationService.class);
+
+    private static final String PREFIXES = """
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        """;
+
+    private final SparqlDatasetService datasetService;
+    private final OntologyIndexService indexService;
+    private final ProjectMetadataService metadataService;
+    private final GraphGeneratingService graphGeneratingService;
+    private final TopLevelClassCacheService topLevelCacheService;
+    private final StorageManager storageManager;
+    private final Executor metadataExecutor;
+
+    @Autowired @Lazy
+    private VisualizationController visualizationController;
+
+    @Autowired(required = false) @Nullable
+    private HierarchyIndexService hierarchyIndexService;
+
+    @Autowired(required = false) @Nullable
+    private ProjectOntologyCache ontologyCache;
+
+    @Autowired(required = false) @Nullable
+    private DesktopOwlApiMutationService desktopOwlApiMutationService;
+
+    @Autowired(required = false) @Nullable
+    private DraftCopyService draftCopyService;
+
+    @Autowired(required = false) @Nullable
+    private EntityUsageIndexService entityUsageIndexService;
+
+    @Autowired(required = false) @Nullable
+    private ClassDetailCacheService classDetailCacheService;
+
+    @Autowired @Lazy
+    private MainGraphRevisionService mainGraphRevisionService;
+
+    @Autowired(required = false) @Nullable
+    private EditorReasonerCacheService editorReasonerCacheService;
+
+    @Autowired(required = false) @Nullable
+    private OntologyHistoryService historyService;
+
+    @Autowired(required = false) @Nullable
+    private RawUpdateHistory rawUpdateHistory;
+
+    @Value("${ontology.plugin-service.url:http://localhost:8087}")
+    private String pluginServiceUrl;
+
+    @Value("${ontocode.internal.token:ontocode-internal}")
+    private String internalToken;
+
+    private final RestTemplate reasonerCacheInvalidationRestTemplate = buildShortTimeoutRestTemplate();
+
+    private static RestTemplate buildShortTimeoutRestTemplate() {
+        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
+        f.setConnectTimeout(3_000);
+        f.setReadTimeout(5_000);
+        return new RestTemplate(f);
+    }
+
+    public OntologyMutationService(SparqlDatasetService datasetService,
+                                   OntologyIndexService indexService,
+                                   ProjectMetadataService metadataService,
+                                   GraphGeneratingService graphGeneratingService,
+                                   TopLevelClassCacheService topLevelCacheService,
+                                   StorageManager storageManager,
+                                   @Qualifier("metadataExecutor") Executor metadataExecutor) {
+        this.datasetService = datasetService;
+        this.indexService = indexService;
+        this.metadataService = metadataService;
+        this.graphGeneratingService = graphGeneratingService;
+        this.topLevelCacheService = topLevelCacheService;
+        this.storageManager = storageManager;
+        this.metadataExecutor = metadataExecutor;
+    }
+
+    public void invalidatePublicCodeViewCache(String projectId, boolean draft) {
+        if (!draft) {
+            storageManager.clearCodeViewCache(projectId);
+        }
+    }
+
+    public void bumpMainGraphRevision(String projectId) {
+        if (mainGraphRevisionService != null) {
+            try {
+                mainGraphRevisionService.incrementRevision(projectId);
+            } catch (Exception e) {
+                log.warn("[MUTATION] Failed bumping main graph revision for project {}", projectId, e);
+            }
+        }
+    }
+
+    public void invalidateReasonerCaches(String projectId) {
+        invalidateReasonerCaches(projectId, false);
+    }
+
+    public void invalidateReasonerCaches(String projectId, boolean draft) {
+        invalidateReasonerCaches(projectId, draft, null);
+    }
+
+    public void invalidateReasonerCaches(String projectId, boolean draft, @Nullable String userId) {
+        if (editorReasonerCacheService != null) {
+            try {
+                if (draft) {
+                    editorReasonerCacheService.invalidateDraft(projectId, userId);
+                } else {
+                    editorReasonerCacheService.invalidateOntology(projectId);
+                }
+            } catch (Exception e) {
+                log.warn("[MUTATION] Failed invalidating editor reasoner cache for project {}", projectId, e);
+            }
+        }
+
+        if (draft) {
+            return;
+        }
+
+        metadataExecutor.execute(() -> {
+            try {
+                String url = pluginServiceUrl + "/api/reasoner/clear-cache/"
+                    + URLEncoder.encode(projectId, StandardCharsets.UTF_8);
+                org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+                headers.set("X-Ontocode-Internal-Token", internalToken);
+                reasonerCacheInvalidationRestTemplate.postForEntity(
+                        url, new org.springframework.http.HttpEntity<>(headers), Map.class);
+            } catch (Exception e) {
+                log.warn("[MUTATION] Failed busting plugin-service reasoner cache for project {} (non-fatal)",
+                    projectId, e);
+            }
+        });
+    }
+
+    public void invalidateEntityCaches(String projectId, @Nullable List<String> affectedIris, boolean draft) {
+        if (affectedIris != null) {
+            if (entityUsageIndexService != null) entityUsageIndexService.invalidate(projectId, affectedIris);
+            if (classDetailCacheService != null) classDetailCacheService.invalidate(projectId, affectedIris);
+        } else if (!draft) {
+            if (classDetailCacheService != null) classDetailCacheService.dropAll(projectId);
+            if (entityUsageIndexService != null) {
+                entityUsageIndexService.dropAll(projectId);
+                entityUsageIndexService.scheduleBuild(projectId);
+            }
+        }
+        if (!draft) {
+            topLevelCacheService.evict(projectId);
+        }
+        if (hierarchyIndexService != null) {
+            hierarchyIndexService.markStale(projectId);
+        }
+        graphGeneratingService.clearGraphCache();
+        if (visualizationController != null) {
+            visualizationController.clearCache(projectId);
+        }
+    }
+
+    private static List<String> affectedIris(List<MutationOp> ops, Set<String> reverseReferenceIris) {
+        return Stream.concat(
+                ops.stream().flatMap(op -> Stream.of(op.iri(), op.parent(), op.target(), op.classIri())),
+                reverseReferenceIris.stream())
+            .filter(Objects::nonNull)
+            .distinct()
+            .toList();
+    }
+
+    public void apply(String projectId, List<MutationOp> ops) {
+        apply(projectId, ops, false, null);
+    }
+
+    public void applyDraft(String projectId, String userId, List<MutationOp> ops) {
+        apply(projectId, ops, true, userId);
+    }
+
+    public void applyForRollback(String projectId, List<MutationOp> ops) {
+        apply(projectId, ops, false, null);
+    }
+
+    public void applyDraftForRollback(String projectId, String userId, List<MutationOp> ops) {
+        apply(projectId, ops, true, userId);
+    }
+
+    private void apply(String projectId, List<MutationOp> ops, boolean draft, String userId) {
+        if (ops == null || ops.isEmpty()) {
+            log.warn("[MUTATION] No operations to apply for project: {}", projectId);
+            return;
+        }
+
+        log.info("[MUTATION] Applying {} mutations for project={}", ops.size(), projectId);
+        long mutationStart = System.currentTimeMillis();
+                String sparql = PREFIXES + "\n" + ops.stream()
+                .map(op -> toUpdate(projectId, op))
+                .filter(s -> s != null && !s.isBlank())
+                .collect(Collectors.joining("\n;\n"));
+
+        if (sparql.trim().equals(PREFIXES.trim())) {
+            String opTypes = ops.stream().map(MutationOp::type).collect(Collectors.joining(", "));
+            log.error("[MUTATION] No valid SPARQL produced for ops: {}", opTypes);
+            throw new IllegalArgumentException(
+                    "Mutation could not be applied: missing required fields or unsupported restriction type (ops: "
+                            + opTypes + ")");
+        }
+
+        log.info("[MUTATION] Generated SPARQL (BEFORE graph injection):");
+        log.info("[MUTATION] {}", sparql);
+
+        java.util.Set<String> reverseReferenceIris = new java.util.LinkedHashSet<>();
+        for (MutationOp op : ops) {
+            reverseReferenceIris.addAll(collectReverseReferenceIris(projectId, op));
+        }
+
+        try {
+
+            if (!draft && desktopOwlApiMutationService != null
+                    && desktopOwlApiMutationService.tryApply(projectId, ops, sparql)) {
+                long version = metadataService.incrementMutationVersion(projectId);
+                if (ontologyCache != null) {
+                    ontologyCache.updateCachedVersion(projectId, version);
+                }
+                invalidatePublicCodeViewCache(projectId, draft);
+                invalidateEntityCaches(projectId, affectedIris(ops, reverseReferenceIris), draft);
+                bumpMainGraphRevision(projectId);
+                invalidateReasonerCaches(projectId);
+                return;
+            }
+
+            long sparqlStart = System.currentTimeMillis();
+            MutationContext.setOps(ops);
+            try {
+                if (draft) {
+                    requireDraftCopyReady(projectId, userId);
+                    datasetService.execDraftUpdateCopyOnSwitch(projectId, userId, sparql);
+                    storageManager.bumpDraftGraphVersion(projectId, userId);
+                } else {
+                    markDirtyAfterRawWrite(projectId);
+                    datasetService.execUpdate(projectId, sparql);
+                    bumpMainGraphRevision(projectId);
+                }
+            } finally {
+                MutationContext.getAndClear();
+            }
+            long sparqlDuration = System.currentTimeMillis() - sparqlStart;
+            log.info("[MUTATION] SPARQL update completed in {}ms for project={}", sparqlDuration, projectId);
+
+            invalidatePublicCodeViewCache(projectId, draft);
+            invalidateEntityCaches(projectId, affectedIris(ops, reverseReferenceIris), draft);
+            invalidateReasonerCaches(projectId, draft, userId);
+            log.info("[MUTATION] Graph cache cleared after mutations");
+
+            if (ops.stream().anyMatch(op -> "addDisjointUnion".equals(op.type()))) {
+                log.info("[MUTATION] Verifying DisjointUnion insertion...");
+                for (MutationOp op : ops) {
+                    if ("addDisjointUnion".equals(op.type())) {
+                        String verifyQuery = PREFIXES + """
+                            SELECT ?list ?member WHERE {
+                              <%s> owl:disjointUnionOf ?list .
+                              ?list rdf:rest*/rdf:first ?member .
+                            }
+                            """.formatted(op.iri());
+                        log.info("[MUTATION] Verification query: {}", verifyQuery);
+                        try {
+                            var result = datasetService.execSelect(projectId, verifyQuery);
+                            int count = 0;
+                            while (result.hasNext()) {
+                                var binding = result.next();
+                                count++;
+                                log.info("[MUTATION] Found member: {}", binding.getValue("member"));
+                            }
+                            log.info("[MUTATION] Verification found {} members", count);
+                        } catch (Exception e) {
+                            log.error("[MUTATION] Verification query failed: {}", e.getMessage());
+                        }
+                    }
+                }
+            }
+
+            String verifyGraphUri = draft
+                    ? datasetService.getDraftGraphUri(projectId, userId)
+                    : datasetService.getGraphUri(projectId);
+            for (MutationOp op : ops) {
+                if ("addDataRestriction".equals(op.type())) {
+                    verifyRestrictionInserted(projectId, verifyGraphUri, op, true);
+                } else if ("addObjectRestriction".equals(op.type())) {
+                    verifyRestrictionInserted(projectId, verifyGraphUri, op, false);
+                }
+            }
+        } catch (DraftNotReadyException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("[MUTATION] ❌ Failed to apply mutations: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to apply mutations", e);
+        }
+
+        CompletableFuture.runAsync(() -> {
+            Map<String, Object> meta = indexService.computeMetadata(projectId);
+            metadataService.writeMeta(projectId, meta);
+        }, metadataExecutor);
+    }
+
+    private void markDirtyAfterRawWrite(String projectId) {
+        if (ontologyCache != null && ontologyCache.has(projectId)) {
+            ontologyCache.evict(projectId);
+        }
+        try {
+            java.nio.file.Path dirtyMarker = storageManager.projectDir(projectId).resolve("ontology.dirty");
+            java.nio.file.Files.createFile(dirtyMarker);
+        } catch (java.nio.file.FileAlreadyExistsException ignored) {
+
+        } catch (Exception e) {
+            log.warn("[MUTATION] Could not create dirty marker for project {}: {}", projectId, e.getMessage());
+        }
+    }
+
+    public void applyRawUpdate(String projectId, String sparql) {
+        applyRawUpdate(projectId, sparql, false, null);
+    }
+
+    public void applyRawUpdateWithHistory(String projectId, String sparql, boolean draft,
+                                           String userId, String username) {
+        org.eclipse.rdf4j.model.Model before = rawUpdateHistory == null ? null : rawUpdateHistory.snapshot(projectId, draft, userId);
+        applyRawUpdate(projectId, sparql, draft, userId);
+        if (before != null) {
+            String actor = RequestActor.recordedId(null, userId, draft);
+            rawUpdateHistory.record(projectId, draft, actor, username == null || username.isBlank() ? actor : username, before);
+        }
+    }
+
+    public void applyRawUpdate(String projectId, String sparql, boolean draft, String userId) {
+        if (sparql == null || sparql.isBlank()) {
+            log.warn("[MUTATION] Empty raw SPARQL update for project={}", projectId);
+            return;
+        }
+
+        if (!draft && desktopOwlApiMutationService != null && desktopOwlApiMutationService.tryApplyRaw(projectId, sparql)) {
+            long version = metadataService.incrementMutationVersion(projectId);
+            if (ontologyCache != null) {
+                ontologyCache.updateCachedVersion(projectId, version);
+            }
+            topLevelCacheService.evict(projectId);
+            invalidatePublicCodeViewCache(projectId, false);
+            if (classDetailCacheService != null) {
+                classDetailCacheService.dropAll(projectId);
+            }
+            bumpMainGraphRevision(projectId);
+            invalidateReasonerCaches(projectId);
+            return;
+        }
+
+        if (draft) {
+            requireDraftCopyReady(projectId, userId);
+            datasetService.execDraftUpdateCopyOnSwitch(projectId, userId, sparql);
+            storageManager.bumpDraftGraphVersion(projectId, userId);
+        } else {
+            markDirtyAfterRawWrite(projectId);
+            datasetService.execUpdate(projectId, sparql);
+            bumpMainGraphRevision(projectId);
+        }
+        topLevelCacheService.evict(projectId);
+        invalidatePublicCodeViewCache(projectId, draft);
+        graphGeneratingService.clearGraphCache();
+        if (visualizationController != null) {
+            visualizationController.clearCache(projectId);
+        }
+         invalidateReasonerCaches(projectId, draft, userId);
+        if (!draft && classDetailCacheService != null) {
+             classDetailCacheService.dropAll(projectId);
+        }
+
+        if (!draft) {
+            CompletableFuture.runAsync(() -> {
+                Map<String, Object> meta = indexService.computeMetadata(projectId);
+                metadataService.writeMeta(projectId, meta);
+            }, metadataExecutor);
+        }
+    }
+
+    public void makeSiblingsDisjoint(String projectId, List<String> classIds) {
+        makeSiblingsDisjoint(projectId, classIds, false, null);
+    }
+
+    public void makeSiblingsDisjoint(String projectId, List<String> classIds, boolean draft, String userId) {
+        if (classIds == null || classIds.size() < 2) {
+            return;
+        }
+
+        log.info("[MUTATION] Cache cleared: topLevelClasses, classChildren");
+
+        StringBuilder sparqlBuilder = new StringBuilder(PREFIXES);
+        sparqlBuilder.append("\nINSERT DATA {\n");
+
+        for (int i = 0; i < classIds.size(); i++) {
+            for (int j = i + 1; j < classIds.size(); j++) {
+                sparqlBuilder.append("  <")
+                    .append(classIds.get(i))
+                    .append("> owl:disjointWith <")
+                    .append(classIds.get(j))
+                    .append("> .\n");
+            }
+        }
+
+        sparqlBuilder.append("}");
+
+        String sparql = sparqlBuilder.toString();
+        if (draft) {
+            requireDraftCopyReady(projectId, userId);
+            datasetService.execDraftUpdateCopyOnSwitch(projectId, userId, sparql);
+            storageManager.bumpDraftGraphVersion(projectId, userId);
+        } else {
+            markDirtyAfterRawWrite(projectId);
+            datasetService.execUpdate(projectId, sparql);
+            bumpMainGraphRevision(projectId);
+        }
+        topLevelCacheService.evict(projectId);
+        invalidatePublicCodeViewCache(projectId, draft);
+
+        graphGeneratingService.clearGraphCache();
+        if (visualizationController != null) {
+            visualizationController.clearCache(projectId);
+        }
+        invalidateReasonerCaches(projectId, draft, userId);
+
+        if (!draft) {
+            CompletableFuture.runAsync(() -> {
+                Map<String, Object> meta = indexService.computeMetadata(projectId);
+                metadataService.writeMeta(projectId, meta);
+            }, metadataExecutor);
+        }
+    }
+
+    private static final java.util.Set<String> CLASS_IRI_OPS = java.util.Set.of(
+        "addAxiom", "addObjectRestriction", "addDataRestriction",
+        "deleteObjectRestriction", "deleteDataRestriction"
+    );
+
+    private String toUpdate(String projectId, MutationOp op) {
+        String type = op.type();
+
+        if (!CLASS_IRI_OPS.contains(type)) {
+            if (op.iri() == null || op.iri().isBlank() || "null".equals(op.iri())) {
+                log.error("[MUTATION] Invalid IRI for operation {}: iri={}", type, op.iri());
+                throw new IllegalArgumentException("IRI cannot be null or empty for operation: " + type);
+            }
+        }
+
+        if (type == null) throw new IllegalArgumentException("Unsupported op " + type);
+
+        if (type.equals("createClass")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> a owl:Class .\n"
+                + optionalLabel(op.iri(), op.label()) + "\n"
+                + (isRealParentClass(op.parent()) ? "<" + op.iri() + "> rdfs:subClassOf <" + op.parent() + "> .\n" : "")
+                + "}";
+        } else if (type.equals("updateClassLabel")) {
+            return "DELETE { <" + op.iri() + "> rdfs:label ?o }\n"
+                + "INSERT { <" + op.iri() + "> rdfs:label " + literal(op.label()) + " }\n"
+                + "WHERE  { OPTIONAL { <" + op.iri() + "> rdfs:label ?o } }";
+        } else if (type.equals("deleteClass")) {
+
+            return ListAxiomCleanupSparql.deleteReferencing(op.iri()) + ";\n"
+                + buildDeleteDanglingExpressionsSparql(op.iri(), CLASS_EXPR_FILLER_PREDICATES, CLASS_EXPR_ANCHOR_PREDICATES) + ";\n"
+                + "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("addAnnotation")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> <" + op.property() + "> " + annotationLiteral(op.value(), op.language(), op.datatype()) + " .\n"
+                + "}";
+        } else if (type.equals("updateAnnotation")) {
+            String whereClause = op.oldValue() != null && !op.oldValue().isBlank()
+                ? "{ <" + op.iri() + "> <" + op.property() + "> ?oldValue . FILTER(STR(?oldValue) = " + literal(op.oldValue()) + ") }"
+                : "{ <" + op.iri() + "> <" + op.property() + "> ?oldValue }";
+            return "DELETE { <" + op.iri() + "> <" + op.property() + "> ?oldValue }\n"
+                + "INSERT { <" + op.iri() + "> <" + op.property() + "> " + annotationLiteral(op.value(), op.language(), op.datatype()) + " }\n"
+                + "WHERE  " + whereClause;
+        } else if (type.equals("deleteAnnotation")) {
+            if (op.language() != null || op.datatype() != null) {
+
+                return "DELETE DATA {\n"
+                    + "<" + op.iri() + "> <" + op.property() + "> " + annotationLiteral(op.value(), op.language(), op.datatype()) + " .\n"
+                    + "}";
+            }
+
+            return "DELETE { <" + op.iri() + "> <" + op.property() + "> ?v }\n"
+                + "WHERE  { <" + op.iri() + "> <" + op.property() + "> ?v . FILTER(STR(?v) = " + literal(op.value()) + ") }";
+        } else if (type.equals("addSubClassOf")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> rdfs:subClassOf <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteSubClassOf")) {
+
+            if (isBlankNodeRef(op.target())) {
+
+                return "DELETE { <" + op.iri() + "> rdfs:subClassOf ?target }\n"
+                    + "WHERE { <" + op.iri() + "> rdfs:subClassOf ?target .\n"
+                    + "  FILTER(isBlank(?target) && str(?target) = \"" + op.target() + "\") }";
+            } else {
+
+                return "DELETE { <" + op.iri() + "> rdfs:subClassOf <" + op.target() + "> }\n"
+                    + "WHERE { <" + op.iri() + "> rdfs:subClassOf <" + op.target() + "> }";
+            }
+        } else if (type.equals("updateSubClassOf")) {
+
+            return "DELETE { <" + op.iri() + "> rdfs:subClassOf <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> rdfs:subClassOf <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:subClassOf <" + op.value() + "> }";
+        } else if (type.equals("addEquivalentClass")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:equivalentClass <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteEquivalentClass")) {
+
+            if (isBlankNodeRef(op.target())) {
+
+                return "DELETE { <" + op.iri() + "> owl:equivalentClass ?target }\n"
+                    + "WHERE { <" + op.iri() + "> owl:equivalentClass ?target .\n"
+                    + "  FILTER(isBlank(?target) && str(?target) = \"" + op.target() + "\") }";
+            } else {
+
+                return "DELETE { <" + op.iri() + "> owl:equivalentClass <" + op.target() + "> }\n"
+                    + "WHERE { <" + op.iri() + "> owl:equivalentClass <" + op.target() + "> }";
+            }
+        } else if (type.equals("updateEquivalentClass")) {
+
+            return "DELETE { <" + op.iri() + "> owl:equivalentClass <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> owl:equivalentClass <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:equivalentClass <" + op.value() + "> }";
+        } else if (type.equals("addDisjointWith")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:disjointWith <" + op.target() + "> .\n"
+                + "}";
+       } else if (type.equals("deleteDisjointWith")) {
+
+            if (isBlankNodeRef(op.target())) {
+
+                return "DELETE { <" + op.iri() + "> owl:disjointWith ?target }\n"
+                    + "WHERE { <" + op.iri() + "> owl:disjointWith ?target .\n"
+                    + "  FILTER(isBlank(?target) && str(?target) = \"" + op.target() + "\") }";
+            } else {
+
+                return "DELETE { <" + op.iri() + "> owl:disjointWith <" + op.target() + "> .\n"
+                    + "         <" + op.target() + "> owl:disjointWith <" + op.iri() + "> . }\n"
+                    + "WHERE { { <" + op.iri() + "> owl:disjointWith <" + op.target() + "> } \n"
+                    + "        UNION\n"
+                    + "        { <" + op.target() + "> owl:disjointWith <" + op.iri() + "> } }";
+            }
+        } else if (type.equals("deleteFromAllDisjointClasses")) {
+
+            return buildDeleteFromAllDisjointClassesSparql(projectId, op.iri(), op.target());
+        } else if (type.equals("updateDisjointWith")) {
+
+            return "DELETE { <" + op.iri() + "> owl:disjointWith <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> owl:disjointWith <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:disjointWith <" + op.value() + "> }";
+        } else if (type.equals("createIndividual")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> a owl:NamedIndividual .\n"
+                + optionalLabel(op.iri(), op.label()) + "\n"
+                + "<" + op.iri() + "> a <" + op.classIri() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteIndividual")) {
+            return ListAxiomCleanupSparql.deleteReferencing(op.iri()) + ";\n"
+                + "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("createObjectProperty")) {
+            return createPropertySparql(op.iri(), op.label(), op.parent(), "owl:ObjectProperty");
+        } else if (type.equals("createDataProperty")) {
+            return createPropertySparql(op.iri(), op.label(), op.parent(), "owl:DatatypeProperty");
+        } else if (type.equals("createAnnotationProperty")) {
+            return createPropertySparql(op.iri(), op.label(), op.parent(), "owl:AnnotationProperty");
+        } else if (type.equals("deleteObjectProperty")) {
+
+            return ListAxiomCleanupSparql.deleteReferencing(op.iri()) + ";\n"
+                + buildDeleteDanglingExpressionsSparql(op.iri(), "owl:onProperty", PROPERTY_EXPR_ANCHOR_PREDICATES) + ";\n"
+                + "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s <" + op.iri() + "> ?o } WHERE { ?s <" + op.iri() + "> ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("deleteDataProperty")) {
+
+            return ListAxiomCleanupSparql.deleteReferencing(op.iri()) + ";\n"
+                + buildDeleteDanglingExpressionsSparql(op.iri(), "owl:onProperty", PROPERTY_EXPR_ANCHOR_PREDICATES) + ";\n"
+                + "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s <" + op.iri() + "> ?o } WHERE { ?s <" + op.iri() + "> ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("deleteAnnotationProperty")) {
+            return "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s <" + op.iri() + "> ?o } WHERE { ?s <" + op.iri() + "> ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("addPropertyDomain")) {
+            if (op.restrictionType() != null) {
+
+                boolean isDataRestriction = "DataRestriction".equals(op.axiomType());
+                return buildRestrictionInsertData(
+                        op.iri(), "rdfs:domain", op.property(), op.restrictionType(), op.target(),
+                        op.cardinality(), isDataRestriction);
+            } else {
+                return "INSERT DATA {\n"
+                    + "<" + op.iri() + "> rdfs:domain <" + op.target() + "> .\n"
+                    + "}";
+            }
+        } else if (type.equals("deletePropertyDomain")) {
+            if (op.target() != null && op.target().contains("|||")) {
+                return buildDeletePropertyRestrictionSparql(op.iri(), "rdfs:domain", op.target());
+            }
+
+            return "DELETE { <" + op.iri() + "> rdfs:domain <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:domain <" + op.target() + "> }";
+        } else if (type.equals("addPropertyRange")) {
+            if (op.restrictionType() != null) {
+
+                boolean isDataRestriction = "DataRestriction".equals(op.axiomType());
+                return buildRestrictionInsertData(
+                        op.iri(), "rdfs:range", op.property(), op.restrictionType(), op.target(),
+                        op.cardinality(), isDataRestriction);
+            } else if (op.target() != null && op.target().contains("[")) {
+                String drSparql = buildDatatypeRestrictionSparql(op.iri(), op.target(), "rdfs:range");
+                if (!drSparql.isEmpty()) return drSparql;
+            }
+            String rangeTarget = op.target();
+            if (rangeTarget != null && !rangeTarget.startsWith("http") && rangeTarget.contains(":")) {
+                rangeTarget = resolvePrefixedIri(rangeTarget);
+            }
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> rdfs:range <" + rangeTarget + "> .\n"
+                + "}";
+        } else if (type.equals("deletePropertyRange")) {
+            if (op.target() != null && op.target().contains("|||")) {
+                return buildDeletePropertyRestrictionSparql(op.iri(), "rdfs:range", op.target());
+            }
+            if (op.target() != null && op.target().contains("[")) {
+                return buildDeleteDatatypeRestrictionSparql(op.iri(), "rdfs:range");
+            }
+
+            return "DELETE { <" + op.iri() + "> rdfs:range <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:range <" + op.target() + "> }";
+        } else if (type.equals("addDatatypeDefinition")) {
+            return buildDatatypeDefinitionSparql(op.iri(), op.value());
+        } else if (type.equals("deleteDatatypeDefinition")) {
+            return buildDeleteDatatypeDefinitionSparql(op.iri());
+        } else if (type.equals("addSubPropertyOf")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> rdfs:subPropertyOf <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteSubPropertyOf")) {
+
+            return "DELETE { <" + op.iri() + "> rdfs:subPropertyOf <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:subPropertyOf <" + op.target() + "> }";
+        } else if (type.equals("updateSubPropertyOf")) {
+
+            return "DELETE { <" + op.iri() + "> rdfs:subPropertyOf <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> rdfs:subPropertyOf <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:subPropertyOf <" + op.value() + "> }";
+        } else if (type.equals("updatePropertyDomain")) {
+            return "DELETE { <" + op.iri() + "> rdfs:domain <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> rdfs:domain <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:domain <" + op.value() + "> }";
+        } else if (type.equals("updatePropertyRange")) {
+            return "DELETE { <" + op.iri() + "> rdfs:range <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> rdfs:range <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> rdfs:range <" + op.value() + "> }";
+        } else if (type.equals("updateInverseProperty")) {
+
+            return "DELETE { <" + op.iri() + "> owl:inverseOf <" + op.value() + "> . <" + op.value() + "> owl:inverseOf <" + op.iri() + "> }\n"
+                + "INSERT { <" + op.iri() + "> owl:inverseOf <" + op.target() + "> . <" + op.target() + "> owl:inverseOf <" + op.iri() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:inverseOf <" + op.value() + "> }";
+        } else if (type.equals("updateDisjointProperty")) {
+            return "DELETE { <" + op.iri() + "> owl:propertyDisjointWith <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> owl:propertyDisjointWith <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:propertyDisjointWith <" + op.value() + "> }";
+        } else if (type.equals("updateEquivalentProperty")) {
+            return "DELETE { <" + op.iri() + "> owl:equivalentProperty <" + op.value() + "> }\n"
+                + "INSERT { <" + op.iri() + "> owl:equivalentProperty <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:equivalentProperty <" + op.value() + "> }";
+        } else if (type.equals("addInverseProperty")) {
+
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:inverseOf <" + op.target() + "> .\n"
+                + "<" + op.target() + "> owl:inverseOf <" + op.iri() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteInverseProperty")) {
+
+            return "DELETE { <" + op.iri() + "> owl:inverseOf <" + op.target() + "> . <" + op.target() + "> owl:inverseOf <" + op.iri() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:inverseOf <" + op.target() + "> }";
+        } else if (type.equals("addDisjointProperty")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:propertyDisjointWith <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteDisjointProperty")) {
+
+            return "DELETE { <" + op.iri() + "> owl:propertyDisjointWith <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:propertyDisjointWith <" + op.target() + "> }";
+        } else if (type.equals("addEquivalentProperty")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:equivalentProperty <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteEquivalentProperty")) {
+
+            return "DELETE { <" + op.iri() + "> owl:equivalentProperty <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> owl:equivalentProperty <" + op.target() + "> }";
+        } else if (type.equals("addCharacteristic")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> a <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteCharacteristic")) {
+
+            return "DELETE { <" + op.iri() + "> a <" + op.target() + "> }\n"
+                + "WHERE { <" + op.iri() + "> a <" + op.target() + "> }";
+        } else if (type.equals("addAxiom")) {
+
+            String axiomKind = op.value();
+            String subject = op.classIri();
+            String object = op.target();
+
+            if (axiomKind == null || axiomKind.isBlank()) {
+                log.warn("[MUTATION] addAxiom missing axiom kind: {}", op);
+                return "";
+            }
+            if (subject == null || subject.isBlank() || object == null || object.isBlank()) {
+                log.warn("[MUTATION] addAxiom missing subject/object: {}", op);
+                return "";
+            }
+
+            return switch (axiomKind) {
+                case "SameIndividual" ->
+                    "INSERT DATA {\n"
+                        + "<" + subject + "> owl:sameAs <" + object + "> .\n"
+                        + "<" + object + "> owl:sameAs <" + subject + "> .\n"
+                        + "}";
+                case "DifferentIndividuals" ->
+                    "INSERT DATA {\n"
+                        + "<" + subject + "> owl:differentFrom <" + object + "> .\n"
+                        + "<" + object + "> owl:differentFrom <" + subject + "> .\n"
+                        + "}";
+                case "ClassAssertion" ->
+                    "INSERT DATA {\n"
+                        + "<" + subject + "> a <" + object + "> .\n"
+                        + "}";
+                case "EquivalentTo", "SubClassOf", "DisjointWith" -> {
+
+                    if (object.startsWith("http://") || object.startsWith("https://") || object.startsWith("urn:")) {
+                        String predicate = getAxiomPredicate(axiomKind);
+                        yield "INSERT DATA {\n"
+                            + "<" + subject + "> " + predicate + " <" + object + "> .\n"
+                            + "}";
+                    }
+                    log.warn("[MUTATION] addAxiom unsupported (non-IRI RHS) kind={} target={}", axiomKind, object);
+                    yield "";
+                }
+                default -> {
+                    log.warn("[MUTATION] addAxiom unsupported kind={}", axiomKind);
+                    yield "";
+                }
+            };
+        } else if (type.equals("addDisjointUnion")) {
+            log.info("[MUTATION] Processing addDisjointUnion: iri={}, value={}", op.iri(), op.value());
+            String[] memberIris = op.value() != null ? op.value().split(",") : new String[0];
+            log.info("[MUTATION] Parsed {} member IRIs", memberIris.length);
+            if (memberIris.length < 2) {
+                log.warn("[MUTATION] DisjointUnion requires at least 2 member classes, got {}", memberIris.length);
+                return "";
+            }
+            String sparql = SetExpressionSparql.disjointUnion(op.iri(), memberIris);
+            log.info("[MUTATION] Generated DisjointUnion SPARQL: {}", sparql);
+            if (sparql == null || sparql.trim().isEmpty()) {
+                log.error("[MUTATION] Generated empty SPARQL for DisjointUnion!");
+                return "";
+            }
+            return sparql;
+        } else if (type.equals("deleteDisjointUnion")) {
+            log.info("[MUTATION] Processing deleteDisjointUnion: iri={}, target={}", op.iri(), op.target());
+            return buildDeleteDisjointUnionSparql(op.iri(), op.target());
+        } else if (type.equals("addHasKey")) {
+            String[] propertyIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (propertyIris.length < 1) {
+                log.warn("[MUTATION] HasKey requires at least 1 property");
+                return "";
+            }
+            return buildHasKeySparql(op.iri(), propertyIris);
+        } else if (type.equals("deleteHasKey")) {
+            return buildDeleteHasKeySparql(op.iri(), op.target());
+        } else if (type.equals("addIntersection")) {
+            String[] memberIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (memberIris.length < 2) {
+                log.warn("[MUTATION] Intersection requires at least 2 member classes");
+                return "";
+            }
+            return SetExpressionSparql.intersection(op.iri(), memberIris, op.axiomType(), getAxiomPredicate(op.axiomType()));
+        } else if (type.equals("deleteIntersection")) {
+            return buildDeleteComplexExpressionSparql(op.iri(), op.target(), op.axiomType());
+        } else if (type.equals("addGCAIntersection")) {
+
+            String[] memberIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (memberIris.length < 2) {
+                log.warn("[MUTATION] GCA intersection requires at least 2 member classes");
+                return "";
+            }
+            return buildGCAIntersectionSparql(op.iri(), memberIris);
+        } else if (type.equals("addGCAUnion")) {
+
+            String[] memberIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (memberIris.length < 2) {
+                log.warn("[MUTATION] GCA union requires at least 2 member classes");
+                return "";
+            }
+            return buildGCAUnionSparql(op.iri(), memberIris);
+        } else if (type.equals("addUnion")) {
+            String[] memberIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (memberIris.length < 2) {
+                log.warn("[MUTATION] Union requires at least 2 member classes");
+                return "";
+            }
+            return SetExpressionSparql.union(op.iri(), memberIris, op.axiomType(), getAxiomPredicate(op.axiomType()));
+        } else if (type.equals("deleteUnion")) {
+            return buildDeleteComplexExpressionSparql(op.iri(), op.target(), op.axiomType());
+        } else if (type.equals("addComplement")) {
+            return buildComplementSparql(op.iri(), op.target(), op.axiomType());
+        } else if (type.equals("deleteComplement")) {
+            return buildDeleteComplexExpressionSparql(op.iri(), op.target(), op.axiomType());
+        } else if (type.equals("addOneOf")) {
+            String[] individualIris = op.value() != null ? op.value().split(",") : new String[0];
+            if (individualIris.length < 1) {
+                log.warn("[MUTATION] OneOf requires at least 1 individual");
+                return "";
+            }
+            return SetExpressionSparql.oneOf(op.iri(), individualIris, op.axiomType(),
+                    getAxiomPredicate(op.axiomType() != null ? op.axiomType() : "EquivalentTo"));
+        } else if (type.equals("deleteOneOf")) {
+            return buildDeleteComplexExpressionSparql(op.iri(), op.target(), op.axiomType());
+        } else if (type.equals("addObjectRestriction")) {
+            return buildRestrictionSparql(op, false);
+        } else if (type.equals("deleteObjectRestriction")) {
+            return buildDeleteRestrictionSparql(op, false);
+        } else if (type.equals("addDataRestriction")) {
+            return buildRestrictionSparql(op, true);
+        } else if (type.equals("deleteDataRestriction")) {
+            return buildDeleteRestrictionSparql(op, true);
+        } else if (type.equals("createDatatype")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> a rdfs:Datatype .\n"
+                + optionalLabel(op.iri(), op.label()) + "\n"
+                + "}";
+        } else if (type.equals("deleteDatatype")) {
+
+            return buildDeleteDanglingExpressionsSparql(op.iri(), "owl:someValuesFrom|owl:allValuesFrom", DATATYPE_EXPR_ANCHOR_PREDICATES) + ";\n"
+                + "DELETE { <" + op.iri() + "> ?p ?o } WHERE { <" + op.iri() + "> ?p ?o };\n"
+                + "DELETE { ?s ?p <" + op.iri() + "> } WHERE { ?s ?p <" + op.iri() + "> }";
+        } else if (type.equals("addObjectPropertyAssertion")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> <" + op.property() + "> <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteObjectPropertyAssertion")) {
+            return "DELETE DATA {\n"
+                + "<" + op.iri() + "> <" + op.property() + "> <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("addDataPropertyAssertion")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> <" + op.property() + "> "
+                + annotationLiteral(op.value(), op.language(), op.datatype()) + " .\n"
+                + "}";
+        } else if (type.equals("deleteDataPropertyAssertion")) {
+            return "DELETE DATA {\n"
+                + "<" + op.iri() + "> <" + op.property() + "> " + literal(op.value()) + " .\n"
+                + "}";
+        } else if (type.equals("addNegativeObjectPropertyAssertion")) {
+            String npaIri = negativePropertyAssertionIri(op, true);
+            return "INSERT DATA {\n"
+                + "<" + npaIri + "> a owl:NegativePropertyAssertion ;\n"
+                + "  owl:sourceIndividual <" + op.iri() + "> ;\n"
+                + "  owl:assertionProperty <" + op.property() + "> ;\n"
+                + "  owl:targetIndividual <" + op.target() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteNegativeObjectPropertyAssertion")) {
+            String npaIri = negativePropertyAssertionIri(op, true);
+            return "DELETE WHERE { <" + npaIri + "> ?p ?o }";
+        } else if (type.equals("addNegativeDataPropertyAssertion")) {
+            String npaIri = negativePropertyAssertionIri(op, false);
+            return "INSERT DATA {\n"
+                + "<" + npaIri + "> a owl:NegativePropertyAssertion ;\n"
+                + "  owl:sourceIndividual <" + op.iri() + "> ;\n"
+                + "  owl:assertionProperty <" + op.property() + "> ;\n"
+                + "  owl:targetValue " + literal(op.value()) + " .\n"
+                + "}";
+        } else if (type.equals("deleteNegativeDataPropertyAssertion")) {
+            String npaIri = negativePropertyAssertionIri(op, false);
+            return "DELETE WHERE { <" + npaIri + "> ?p ?o }";
+        } else if (type.equals("addSameIndividual")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:sameAs <" + op.target() + "> .\n"
+                + "<" + op.target() + "> owl:sameAs <" + op.iri() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteSameIndividual")) {
+            return "DELETE DATA {\n"
+                + "<" + op.iri() + "> owl:sameAs <" + op.target() + "> .\n"
+                + "<" + op.target() + "> owl:sameAs <" + op.iri() + "> .\n"
+                + "}";
+        } else if (type.equals("addDifferentIndividual")) {
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> owl:differentFrom <" + op.target() + "> .\n"
+                + "<" + op.target() + "> owl:differentFrom <" + op.iri() + "> .\n"
+                + "}";
+        } else if (type.equals("deleteDifferentIndividual")) {
+            return "DELETE DATA {\n"
+                + "<" + op.iri() + "> owl:differentFrom <" + op.target() + "> .\n"
+                + "<" + op.target() + "> owl:differentFrom <" + op.iri() + "> .\n"
+                + "}";
+        } else if (type.equals("addPropertyChain")) {
+            String[] chainProps = op.value() != null ? op.value().split(" o ") : new String[0];
+            if (chainProps.length < 2) {
+                log.warn("[MUTATION] Property chain requires at least 2 properties, got: {}", op.value());
+                return "";
+            }
+            return buildPropertyChainSparql(op.iri(), chainProps);
+        } else if (type.equals("deletePropertyChain")) {
+            String[] chainProps = op.value() != null ? op.value().split(" o ") : new String[0];
+            if (chainProps.length < 2) {
+                log.warn("[MUTATION] Property chain delete requires at least 2 properties, got: {}", op.value());
+                return "";
+            }
+            return buildDeletePropertyChainSparql(op.iri(), chainProps);
+        } else if (type.equals("addClassAssertion")) {
+
+            if (op.classIri() == null) return "";
+            String classExpr = buildClassExpressionSparql(projectId, op.classIri());
+            return "INSERT DATA {\n"
+                + "<" + op.iri() + "> a " + classExpr + " .\n"
+                + "}";
+        } else if (type.equals("removeClassAssertion")) {
+
+            if (op.classIri() == null) return "";
+            String classExpr = buildClassExpressionSparql(projectId, op.classIri());
+            return "DELETE DATA {\n"
+                + "<" + op.iri() + "> a " + classExpr + " .\n"
+                + "}";
+        } else if (type.equals("deleteAxiom")) {
+            return buildDeleteBlankNodeAxiomSparql(op.iri(), op.ancestorIri());
+        } else {
+            throw new IllegalArgumentException("Unsupported op " + op.type());
+        }
+    }
+
+    private boolean isBlankNodeRef(String target) {
+        return target == null || !(target.startsWith("http://") || target.startsWith("https://"));
+    }
+
+    public static boolean isRealParentClass(String parent) {
+        return parent != null && !parent.isBlank()
+            && !"http://www.w3.org/2002/07/owl#Thing".equals(parent) && !"owl:Thing".equals(parent);
+    }
+
+    private String optionalLabel(String iri, String label) {
+        return (label == null || label.isBlank())
+                ? ""
+                : "<%s> rdfs:label %s .".formatted(iri, literal(label));
+    }
+
+    private String literal(String value) {
+        if (value == null) {
+            return "\"\"";
+        }
+
+        String escaped = value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t");
+        return "\"%s\"".formatted(escaped);
+    }
+
+    private String annotationLiteral(String value, String language, String datatype) {
+        String base = literal(value);
+        if (language != null && !language.isBlank()) {
+            return base + "@" + language.trim().toLowerCase();
+        }
+        if (datatype != null && !datatype.isBlank()) {
+
+            String dt = datatype.startsWith("http") ? "<" + datatype + ">" : datatype;
+            return base + "^^" + dt;
+        }
+        return base;
+    }
+
+    private String negativePropertyAssertionIri(MutationOp op, boolean isObjectTarget) {
+        String raw = isObjectTarget
+            ? "%s|%s|%s".formatted(op.iri(), op.property(), op.target())
+            : "%s|%s|%s".formatted(op.iri(), op.property(), op.value());
+
+        String hash = sha256Hex(raw);
+        return "http://ontocode.org/axiom/negativePropertyAssertion/" + hash;
+    }
+
+    private String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(bytes.length * 2);
+            for (byte b : bytes) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to compute SHA-256", e);
+        }
+    }
+
+    private String createPropertySparql(String iri, String label, String parent, String propertyType) {
+        log.info("[MUTATION] createPropertySparql called:");
+        log.info("[MUTATION]   IRI: {}", iri);
+        log.info("[MUTATION]   Label: {}", label);
+        log.info("[MUTATION]   Parent: {}", parent);
+        log.info("[MUTATION]   PropertyType: {}", propertyType);
+
+        boolean hasRealParent = parent != null && !parent.isEmpty()
+            && !parent.contains("topObjectProperty")
+            && !parent.contains("topDataProperty")
+            && !parent.equals("http://www.w3.org/2002/07/owl#topObjectProperty")
+            && !parent.equals("http://www.w3.org/2002/07/owl#topDataProperty");
+
+        log.info("[MUTATION]   hasRealParent: {}", hasRealParent);
+
+        String sparql;
+        if (hasRealParent) {
+            sparql = """
+                INSERT DATA {
+                  <%s> a %s .
+                  %s
+                  <%s> rdfs:subPropertyOf <%s> .
+                }
+                """.formatted(iri, propertyType, optionalLabel(iri, label), iri, parent);
+        } else {
+            sparql = """
+                INSERT DATA {
+                  <%s> a %s .
+                  %s
+                }
+                """.formatted(iri, propertyType, optionalLabel(iri, label));
+        }
+
+        log.info("[MUTATION]   Generated SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private String buildDeletePropertyRestrictionSparql(String propertyIri, String axiomPredicate, String encodedTarget) {
+        String[] parts = encodedTarget.split("\\|\\|\\|", -1);
+        if (parts.length < 4) {
+            log.warn("[MUTATION] Invalid encoded restriction target (expected >=4 parts): {}", encodedTarget);
+            return "";
+        }
+        String restrictionType = parts[1];
+        String onPropIri = parts[2];
+        String fillerIri = parts[3];
+        String card = parts.length > 4 ? parts[4] : "";
+
+        String fillerPattern = switch (restrictionType) {
+            case "some" -> "?r owl:someValuesFrom <" + fillerIri + "> .";
+            case "only" -> "?r owl:allValuesFrom <" + fillerIri + "> .";
+            case "value" -> "?r owl:hasValue <" + fillerIri + "> .";
+            case "min" -> "?r owl:minQualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n      ?r owl:onClass <" + fillerIri + "> .";
+            case "max" -> "?r owl:maxQualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n      ?r owl:onClass <" + fillerIri + "> .";
+            case "exactly" -> "?r owl:qualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n      ?r owl:onClass <" + fillerIri + "> .";
+            default -> "";
+        };
+
+        if (fillerPattern.isEmpty()) {
+            log.warn("[MUTATION] Unknown restriction type in encoded target: {}", restrictionType);
+            return "";
+        }
+
+        String sparql = PREFIXES + """
+            DELETE {
+              <%s> %s ?r .
+              ?r ?p ?o .
+            }
+            WHERE {
+              <%s> %s ?r .
+              ?r a owl:Restriction .
+              ?r owl:onProperty <%s> .
+              %s
+              ?r ?p ?o .
+              FILTER(isBlank(?r))
+            }
+            """.formatted(propertyIri, axiomPredicate, propertyIri, axiomPredicate, onPropIri, fillerPattern);
+
+        log.info("[MUTATION] buildDeletePropertyRestrictionSparql: {}", sparql);
+        return sparql;
+    }
+
+    private String buildRestrictionBody(String propertyIri, String restrictionType, String fillerIri, Integer cardinality, boolean isDataRestriction) {
+        return switch (restrictionType) {
+            case "some" -> {
+                String fillerPredicate = "owl:someValuesFrom";
+                yield """
+                    [
+                      a owl:Restriction ;
+                      owl:onProperty <%s> ;
+                      %s <%s>
+                    ]""".formatted(propertyIri, fillerPredicate, fillerIri);
+            }
+            case "only" -> {
+                String fillerPredicate = "owl:allValuesFrom";
+                yield """
+                    [
+                      a owl:Restriction ;
+                      owl:onProperty <%s> ;
+                      %s <%s>
+                    ]""".formatted(propertyIri, fillerPredicate, fillerIri);
+            }
+            case "value" -> """
+                [
+                  a owl:Restriction ;
+                  owl:onProperty <%s> ;
+                  owl:hasValue <%s>
+                ]""".formatted(propertyIri, fillerIri);
+            case "min" -> {
+                int card = cardinality != null ? cardinality : 1;
+                String onClassPredicate = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+                yield """
+                [
+                  a owl:Restriction ;
+                  owl:onProperty <%s> ;
+                  owl:minQualifiedCardinality "%d"^^xsd:nonNegativeInteger ;
+                  %s <%s>
+                ]""".formatted(propertyIri, card, onClassPredicate, fillerIri);
+            }
+            case "max" -> {
+                int card = cardinality != null ? cardinality : 1;
+                String onClassPredicate = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+                yield """
+                [
+                  a owl:Restriction ;
+                  owl:onProperty <%s> ;
+                  owl:maxQualifiedCardinality "%d"^^xsd:nonNegativeInteger ;
+                  %s <%s>
+                ]""".formatted(propertyIri, card, onClassPredicate, fillerIri);
+            }
+            case "exactly" -> {
+                int card = cardinality != null ? cardinality : 1;
+                String onClassPredicate = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+                yield """
+                [
+                  a owl:Restriction ;
+                  owl:onProperty <%s> ;
+                  owl:qualifiedCardinality "%d"^^xsd:nonNegativeInteger ;
+                  %s <%s>
+                ]""".formatted(propertyIri, card, onClassPredicate, fillerIri);
+            }
+            default -> "";
+        };
+    }
+
+    private String buildDeleteFromAllDisjointClassesSparql(String projectId, String classIri, String targetIri) {
+        String findQuery = PREFIXES + """
+            SELECT ?member WHERE {
+              ?axiom a owl:AllDisjointClasses ;
+                     owl:members ?list .
+              ?list rdf:rest*/rdf:first ?member .
+              FILTER EXISTS { ?list rdf:rest*/rdf:first <%s> }
+              FILTER EXISTS { ?list rdf:rest*/rdf:first <%s> }
+            }
+            """.formatted(classIri, targetIri);
+
+        List<String> members = new ArrayList<>();
+        try {
+            var result = datasetService.execSelect(projectId, findQuery);
+            while (result.hasNext()) {
+                var binding = result.next();
+                members.add(binding.getValue("member").stringValue());
+            }
+        } catch (Exception e) {
+            log.error("[MUTATION] Failed to find AllDisjointClasses axiom for classIri={}, targetIri={}: {}",
+                    classIri, targetIri, e.getMessage());
+            throw new RuntimeException("Could not locate the disjoint-classes group to update", e);
+        }
+
+        if (members.isEmpty()) {
+            log.warn("[MUTATION] No AllDisjointClasses axiom found containing both {} and {} — falling back to simple pairwise delete",
+                    classIri, targetIri);
+            return "DELETE { <" + classIri + "> owl:disjointWith <" + targetIri + "> }\n"
+                 + "WHERE  { <" + classIri + "> owl:disjointWith <" + targetIri + "> }";
+        }
+
+        StringBuilder sparql = new StringBuilder();
+        sparql.append("""
+            DELETE {
+              ?axiom a owl:AllDisjointClasses .
+              ?axiom owl:members ?list .
+              ?node rdf:first ?first .
+              ?node rdf:rest ?rest .
+            }
+            WHERE {
+              ?axiom a owl:AllDisjointClasses ;
+                     owl:members ?list .
+              ?list rdf:rest* ?node .
+              ?node rdf:first ?first .
+              ?node rdf:rest ?rest .
+              FILTER EXISTS { ?list rdf:rest*/rdf:first <%s> }
+              FILTER EXISTS { ?list rdf:rest*/rdf:first <%s> }
+            }
+            """.formatted(classIri, targetIri));
+
+        List<String> pairInserts = new ArrayList<>();
+        for (int i = 0; i < members.size(); i++) {
+            for (int j = i + 1; j < members.size(); j++) {
+                String m1 = members.get(i);
+                String m2 = members.get(j);
+                boolean isDeletedPair = (m1.equals(classIri) && m2.equals(targetIri))
+                        || (m1.equals(targetIri) && m2.equals(classIri));
+                if (!isDeletedPair) {
+                    pairInserts.add("  <" + m1 + "> owl:disjointWith <" + m2 + "> .");
+                }
+            }
+        }
+
+        if (!pairInserts.isEmpty()) {
+            sparql.append(";\nINSERT DATA {\n");
+            sparql.append(String.join("\n", pairInserts));
+            sparql.append("\n}");
+        }
+
+        return sparql.toString();
+    }
+
+    private String buildRestrictionSparql(MutationOp op, boolean isDataRestriction) {
+        String classIri = op.iri();
+        String propertyIri = op.property();
+        String restrictionType = op.restrictionType();
+        String fillerIri = op.target();
+        Integer cardinality = op.cardinality();
+        String axiomType = op.axiomType();
+
+        log.info("[MUTATION] buildRestrictionSparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   propertyIri: {}", propertyIri);
+        log.info("[MUTATION]   restrictionType: {}", restrictionType);
+        log.info("[MUTATION]   fillerIri: {}", fillerIri);
+        log.info("[MUTATION]   cardinality: {}", cardinality);
+        log.info("[MUTATION]   axiomType: {}", axiomType);
+        log.info("[MUTATION]   isDataRestriction: {}", isDataRestriction);
+
+        if (classIri == null || propertyIri == null || restrictionType == null || fillerIri == null) {
+            log.error("[MUTATION] Missing required fields for restriction: classIri={}, propertyIri={}, restrictionType={}, fillerIri={}",
+                classIri, propertyIri, restrictionType, fillerIri);
+            return "";
+        }
+
+        String axiomPredicate = "rdfs:subClassOf";
+        if (axiomType != null) {
+            axiomPredicate = switch (axiomType) {
+                case "EquivalentTo" -> "owl:equivalentClass";
+                case "DisjointWith" -> "owl:disjointWith";
+                default -> "rdfs:subClassOf";
+            };
+        }
+
+        String sparql = buildRestrictionInsertData(
+                classIri, axiomPredicate, propertyIri, restrictionType, fillerIri, cardinality, isDataRestriction);
+        if (sparql.isEmpty()) {
+            log.warn("[MUTATION] Unknown restriction type: {}", restrictionType);
+            return "";
+        }
+        log.info("[MUTATION]   Generated restriction SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private String buildRestrictionInsertData(String subjectIri, String axiomPredicate,
+                                              String propertyIri, String restrictionType,
+                                              String fillerIri, Integer cardinality,
+                                              boolean isDataRestriction) {
+        if (subjectIri == null || propertyIri == null || restrictionType == null || fillerIri == null) {
+            return "";
+        }
+        String bn = "_:ontocodeR" + java.util.UUID.randomUUID().toString().replace("-", "");
+        StringBuilder triples = new StringBuilder();
+        triples.append("<").append(subjectIri).append("> ").append(axiomPredicate).append(" ").append(bn).append(" .\n");
+        triples.append(bn).append(" a owl:Restriction .\n");
+        triples.append(bn).append(" owl:onProperty <").append(propertyIri).append("> .\n");
+
+        switch (restrictionType) {
+            case "some" -> triples.append(bn).append(" owl:someValuesFrom <").append(fillerIri).append("> .\n");
+            case "only" -> triples.append(bn).append(" owl:allValuesFrom <").append(fillerIri).append("> .\n");
+            case "value" -> triples.append(bn).append(" owl:hasValue <").append(fillerIri).append("> .\n");
+            case "min", "max", "exactly" -> {
+                int card = cardinality != null ? cardinality : 1;
+                String onClassPred = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+                String cardPred = switch (restrictionType) {
+                    case "min" -> "owl:minQualifiedCardinality";
+                    case "max" -> "owl:maxQualifiedCardinality";
+                    default -> "owl:qualifiedCardinality";
+                };
+                triples.append(bn).append(" ").append(cardPred)
+                        .append(" \"").append(card).append("\"^^xsd:nonNegativeInteger .\n");
+                triples.append(bn).append(" ").append(onClassPred)
+                        .append(" <").append(fillerIri).append("> .\n");
+            }
+            default -> {
+                return "";
+            }
+        }
+
+        return "INSERT DATA {\n" + triples + "}";
+    }
+
+    private void verifyRestrictionInserted(String projectId, String graphUri, MutationOp op,
+                                           boolean isDataRestriction) {
+        String classIri = op.iri();
+        String propertyIri = op.property();
+        String restrictionType = op.restrictionType();
+        String fillerIri = op.target();
+        String axiomType = op.axiomType();
+        Integer cardinality = op.cardinality();
+        if (classIri == null || propertyIri == null || restrictionType == null || fillerIri == null) {
+            return;
+        }
+        String axiomPredicate = "rdfs:subClassOf";
+        if (axiomType != null) {
+            axiomPredicate = switch (axiomType) {
+                case "EquivalentTo" -> "owl:equivalentClass";
+                case "DisjointWith" -> "owl:disjointWith";
+                default -> "rdfs:subClassOf";
+            };
+        }
+        String onFillerPred = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+        String restrictionPattern = switch (restrictionType) {
+            case "some" -> "?r owl:someValuesFrom <" + fillerIri + "> .";
+            case "only" -> "?r owl:allValuesFrom <" + fillerIri + "> .";
+            case "value" -> "?r owl:hasValue <" + fillerIri + "> .";
+            case "min" -> {
+                int card = cardinality != null ? cardinality : 1;
+                yield "?r owl:minQualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n"
+                        + "?r " + onFillerPred + " <" + fillerIri + "> .";
+            }
+            case "max" -> {
+                int card = cardinality != null ? cardinality : 1;
+                yield "?r owl:maxQualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n"
+                        + "?r " + onFillerPred + " <" + fillerIri + "> .";
+            }
+            case "exactly" -> {
+                int card = cardinality != null ? cardinality : 1;
+                yield "?r owl:qualifiedCardinality \"" + card + "\"^^xsd:nonNegativeInteger .\n"
+                        + "?r " + onFillerPred + " <" + fillerIri + "> .";
+            }
+            default -> null;
+        };
+        if (restrictionPattern == null) {
+            return;
+        }
+
+        String verifyQuery = PREFIXES + """
+            ASK WHERE {
+              GRAPH <%s> {
+                <%s> %s ?r .
+                ?r owl:onProperty <%s> .
+                %s
+              }
+            }
+            """.formatted(graphUri, classIri, axiomPredicate, propertyIri, restrictionPattern);
+        log.info("[MUTATION] Verifying restriction insertion in graph {}: {}", graphUri, verifyQuery);
+        boolean found = datasetService.execAskInGraph(projectId, graphUri, verifyQuery);
+        if (!found) {
+            log.error("[MUTATION] Restriction verification FAILED for class={} property={} type={} filler={}",
+                    classIri, propertyIri, restrictionType, fillerIri);
+            throw new RuntimeException(
+                    "Restriction was not persisted to the ontology graph (verification failed)");
+        }
+        log.info("[MUTATION] Restriction verification OK for class={}", classIri);
+    }
+
+    private String buildDeleteRestrictionSparql(MutationOp op, boolean isDataRestriction) {
+        String classIri = op.iri();
+        String propertyIri = op.property();
+        String restrictionType = op.restrictionType();
+        String fillerIri = op.target();
+        String axiomType = op.axiomType();
+        Integer cardinality = op.cardinality();
+
+        log.info("[MUTATION] buildDeleteRestrictionSparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   propertyIri: {}", propertyIri);
+        log.info("[MUTATION]   restrictionType: {}", restrictionType);
+        log.info("[MUTATION]   fillerIri: {}", fillerIri);
+        log.info("[MUTATION]   cardinality: {}", cardinality);
+        log.info("[MUTATION]   axiomType: {}", axiomType);
+        log.info("[MUTATION]   isDataRestriction: {}", isDataRestriction);
+
+        if (classIri == null || propertyIri == null || restrictionType == null || fillerIri == null) {
+            log.error("[MUTATION] Missing required fields for delete restriction");
+            throw new IllegalArgumentException("Missing required fields for delete restriction");
+        }
+
+        String axiomPredicate = switch (axiomType != null ? axiomType : "SubClassOf") {
+            case "EquivalentTo" -> "owl:equivalentClass";
+            case "DisjointWith" -> "owl:disjointWith";
+            default -> "rdfs:subClassOf";
+        };
+
+        String onFillerPred = isDataRestriction ? "owl:onDataRange" : "owl:onClass";
+        String restrictionPattern = switch (restrictionType) {
+            case "some" -> "?restriction owl:someValuesFrom <" + fillerIri + "> .";
+            case "only" -> "?restriction owl:allValuesFrom <" + fillerIri + "> .";
+            case "value" -> "?restriction owl:hasValue <" + fillerIri + "> .";
+            case "min", "max", "exactly" -> {
+                int card = cardinality != null ? cardinality : 1;
+                String cardPred = switch (restrictionType) {
+                    case "min" -> "owl:minQualifiedCardinality";
+                    case "max" -> "owl:maxQualifiedCardinality";
+                    default -> "owl:qualifiedCardinality";
+                };
+                yield "?restriction " + cardPred + " \"" + card + "\"^^xsd:nonNegativeInteger .\n"
+                        + "              ?restriction " + onFillerPred + " <" + fillerIri + "> .";
+            }
+            default -> {
+                log.warn("[MUTATION] Unknown restriction type: {}", restrictionType);
+                yield "";
+            }
+        };
+
+        if (restrictionPattern.isEmpty()) {
+            throw new IllegalArgumentException("Unknown restriction type: " + restrictionType);
+        }
+
+        String sparql = """
+            DELETE {
+              <%s> %s ?restriction .
+              ?restriction ?p ?o .
+            }
+            WHERE {
+              <%s> %s ?restriction .
+              ?restriction a owl:Restriction .
+              ?restriction owl:onProperty <%s> .
+              %s
+              ?restriction ?p ?o .
+            }
+            """.formatted(classIri, axiomPredicate, classIri, axiomPredicate, propertyIri, restrictionPattern);
+
+        log.info("[MUTATION] Generated delete restriction SPARQL:");
+        log.info("[MUTATION] {}", sparql);
+
+        return sparql;
+    }
+
+    private String buildDeleteDisjointUnionSparql(String classIri, String listNodeId) {
+        log.info("[MUTATION] buildDeleteDisjointUnionSparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   listNodeId: {}", listNodeId);
+
+        String sparql = """
+            DELETE {
+              <%s> owl:disjointUnionOf ?list .
+              ?node rdf:first ?first .
+              ?node rdf:rest ?rest .
+            }
+            WHERE {
+              <%s> owl:disjointUnionOf ?list .
+              ?list rdf:rest* ?node .
+              ?node rdf:first ?first .
+              ?node rdf:rest ?rest .
+            }
+            """.formatted(classIri, classIri);
+
+        log.info("[MUTATION]   Generated delete disjoint union SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private String buildHasKeySparql(String classIri, String[] propertyIris) {
+        log.info("[MUTATION] buildHasKeySparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   propertyIris: {}", String.join(", ", propertyIris));
+
+        String listHeadIri = "http://ontocode.org/haskey/" + UUID.randomUUID().toString().replace("-", "");
+        StringBuilder insertBuilder = new StringBuilder();
+        insertBuilder.append("INSERT DATA {\n");
+        insertBuilder.append("  <").append(classIri).append("> owl:hasKey <").append(listHeadIri).append("> .\n");
+
+        for (int i = 0; i < propertyIris.length; i++) {
+            String currentNode = (i == 0) ? "<" + listHeadIri + ">" : "_:keyNode" + i;
+            String nextNode = (i == propertyIris.length - 1) ? "rdf:nil" : "_:keyNode" + (i + 1);
+            insertBuilder.append("  ").append(currentNode)
+                .append(" rdf:first <").append(propertyIris[i].trim()).append("> ;\n")
+                .append("               rdf:rest ").append(nextNode).append(" .\n");
+        }
+
+        insertBuilder.append("}\n");
+
+        String sparql = insertBuilder.toString();
+        log.info("[MUTATION]   Generated has key SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private String buildDeleteHasKeySparql(String classIri, String listNodeId) {
+        log.info("[MUTATION] buildDeleteHasKeySparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   listNodeId: {}", listNodeId);
+
+        String sparql;
+        if (listNodeId != null && (listNodeId.startsWith("http://") || listNodeId.startsWith("https://"))) {
+
+            sparql = """
+                DELETE {
+                  <%s> owl:hasKey <%s> .
+                  ?node rdf:first ?first .
+                  ?node rdf:rest ?rest .
+                }
+                WHERE {
+                  <%s> owl:hasKey <%s> .
+                  <%s> rdf:rest* ?node .
+                  ?node rdf:first ?first .
+                  ?node rdf:rest ?rest .
+                }
+                """.formatted(classIri, listNodeId, classIri, listNodeId, listNodeId);
+        } else {
+
+            String propsCsv = listNodeId != null ? listNodeId.replace("hasKey_props_", "").replace("\"", "\\\"") : "";
+            String sortedPropsCsv = java.util.Arrays.stream(propsCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .sorted()
+                    .collect(java.util.stream.Collectors.joining(","));
+            sparql = """
+                DELETE {
+                  <%s> owl:hasKey ?list .
+                  ?node rdf:first ?first .
+                  ?node rdf:rest ?rest .
+                }
+                WHERE {
+                  {
+                    SELECT ?list (GROUP_CONCAT(?prop; separator=",") AS ?propsConcat)
+                    WHERE {
+                      SELECT ?list ?prop
+                      WHERE {
+                        <%s> owl:hasKey ?list .
+                        ?list rdf:rest* ?n .
+                        ?n rdf:first ?prop .
+                      }
+                      ORDER BY ?prop
+                    }
+                    GROUP BY ?list
+                  }
+                  FILTER(?propsConcat = "%s")
+                  ?list rdf:rest* ?node .
+                  ?node rdf:first ?first .
+                  ?node rdf:rest ?rest .
+                }
+                """.formatted(classIri, classIri, sortedPropsCsv);
+        }
+
+        log.info("[MUTATION]   Generated delete has key SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private String buildPropertyChainSparql(String propertyIri, String[] chainPropertyIris) {
+        log.info("[MUTATION] buildPropertyChainSparql: property={}, chain={}", propertyIri, String.join(" o ", chainPropertyIris));
+        StringBuilder sb = new StringBuilder("INSERT DATA {\n");
+        sb.append("  <").append(propertyIri).append("> owl:propertyChainAxiom _:chain0 .\n");
+        for (int i = 0; i < chainPropertyIris.length; i++) {
+            String cur = "_:chain" + i;
+            String next = (i == chainPropertyIris.length - 1) ? "rdf:nil" : "_:chain" + (i + 1);
+            sb.append("  ").append(cur).append(" rdf:first <").append(chainPropertyIris[i].trim()).append("> ;\n");
+            sb.append("             rdf:rest ").append(next).append(" .\n");
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private String buildDeletePropertyChainSparql(String propertyIri, String[] chainPropertyIris) {
+        log.info("[MUTATION] buildDeletePropertyChainSparql: property={}, chain={}", propertyIri, String.join(" o ", chainPropertyIris));
+        int n = chainPropertyIris.length;
+        StringBuilder where = new StringBuilder();
+        where.append("  <").append(propertyIri).append("> owl:propertyChainAxiom ?head .\n");
+
+        for (int i = 0; i < n; i++) {
+            String nodeVar = (i == 0) ? "?head" : "?cn" + i;
+            String nextVar = (i == n - 1) ? "rdf:nil" : "?cn" + (i + 1);
+            where.append("  ").append(nodeVar).append(" rdf:first <").append(chainPropertyIris[i].trim()).append("> .\n");
+            where.append("  ").append(nodeVar).append(" rdf:rest ").append(nextVar).append(" .\n");
+        }
+
+        where.append("  ?head rdf:rest* ?delNode .\n");
+        where.append("  ?delNode rdf:first ?delFirst .\n");
+        where.append("  ?delNode rdf:rest ?delRest .\n");
+        return "DELETE {\n"
+            + "  <" + propertyIri + "> owl:propertyChainAxiom ?head .\n"
+            + "  ?delNode rdf:first ?delFirst .\n"
+            + "  ?delNode rdf:rest ?delRest .\n"
+            + "}\nWHERE {\n"
+            + where.toString()
+            + "}";
+    }
+
+    private String buildGCAIntersectionSparql(String classIri, String[] memberIris) {
+        log.info("[MUTATION] buildGCAIntersectionSparql: classIri={}, members={}", classIri, String.join(", ", memberIris));
+        StringBuilder sb = new StringBuilder("INSERT DATA {\n");
+        sb.append("  _:gcaIntersection owl:intersectionOf _:gcaList0 .\n");
+        sb.append("  _:gcaIntersection rdfs:subClassOf <").append(classIri).append("> .\n");
+        for (int i = 0; i < memberIris.length; i++) {
+            String cur = "_:gcaList" + i;
+            String next = (i == memberIris.length - 1) ? "rdf:nil" : "_:gcaList" + (i + 1);
+            sb.append("  ").append(cur).append(" rdf:first <").append(memberIris[i].trim()).append("> ;\n");
+            sb.append("             rdf:rest ").append(next).append(" .\n");
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private String buildGCAUnionSparql(String classIri, String[] memberIris) {
+        log.info("[MUTATION] buildGCAUnionSparql: classIri={}, members={}", classIri, String.join(", ", memberIris));
+        StringBuilder sb = new StringBuilder("INSERT DATA {\n");
+        sb.append("  _:gcaUnion owl:unionOf _:gcaList0 .\n");
+        sb.append("  _:gcaUnion rdfs:subClassOf <").append(classIri).append("> .\n");
+        for (int i = 0; i < memberIris.length; i++) {
+            String cur = "_:gcaList" + i;
+            String next = (i == memberIris.length - 1) ? "rdf:nil" : "_:gcaList" + (i + 1);
+            sb.append("  ").append(cur).append(" rdf:first <").append(memberIris[i].trim()).append("> ;\n");
+            sb.append("             rdf:rest ").append(next).append(" .\n");
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private String buildComplementSparql(String classIri, String complementIri, String axiomType) {
+        log.info("[MUTATION] buildComplementSparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   complementIri: {}", complementIri);
+        log.info("[MUTATION]   axiomType: {}", axiomType);
+
+        String axiomPredicate = getAxiomPredicate(axiomType);
+
+        String sparql = """
+            INSERT DATA {
+              <%s> %s [
+                owl:complementOf <%s>
+              ] .
+            }
+            """.formatted(classIri, axiomPredicate, complementIri);
+
+        log.info("[MUTATION]   Generated complement SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private static final Pattern DATATYPE_RESTRICTION_EXPR = Pattern.compile("^(.+?)\\[(.+)]$");
+    private static final Pattern FACET_PATTERN = Pattern.compile("(>=|<=|>|<|=)\\s*(.+)");
+
+    private String resolvePrefixedIri(String prefixed) {
+        if (prefixed == null) return null;
+        String trimmed = prefixed.trim();
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("urn:")) {
+            return trimmed;
+        }
+        int colon = trimmed.indexOf(':');
+        if (colon <= 0) return trimmed;
+        String prefix = trimmed.substring(0, colon);
+        String local = trimmed.substring(colon + 1);
+        return switch (prefix) {
+            case "xsd" -> "http://www.w3.org/2001/XMLSchema#" + local;
+            case "rdf" -> "http://www.w3.org/1999/02/22-rdf-syntax-ns#" + local;
+            case "rdfs" -> "http://www.w3.org/2000/01/rdf-schema#" + local;
+            case "owl" -> "http://www.w3.org/2002/07/owl#" + local;
+            default -> trimmed;
+        };
+    }
+
+    private record DatatypeFacet(String predicate, String literalValue, String literalDatatype) {}
+
+    private String buildDatatypeDefinitionSparql(String datatypeIri, String expression) {
+        if (datatypeIri == null || datatypeIri.isBlank() || expression == null || expression.isBlank()) {
+            return "";
+        }
+        String trimmed = expression.trim();
+        if (!trimmed.contains("[")) {
+            String baseIri = resolvePrefixedIri(trimmed);
+            return PREFIXES + "INSERT DATA {\n"
+                + "<" + datatypeIri + "> a rdfs:Datatype ;\n"
+                + "  owl:equivalentClass <" + baseIri + "> .\n"
+                + "}";
+        }
+        return buildDatatypeRestrictionSparql(datatypeIri, trimmed, "owl:equivalentClass");
+    }
+
+    private String buildDeleteDatatypeDefinitionSparql(String datatypeIri) {
+        if (datatypeIri == null || datatypeIri.isBlank()) return "";
+        return PREFIXES + """
+            DELETE {
+              <%s> owl:equivalentClass ?dr .
+              ?dr ?p ?o .
+              ?list ?lp ?lo .
+              ?facet ?fp ?fo .
+            }
+            WHERE {
+              <%s> owl:equivalentClass ?dr .
+              OPTIONAL { ?dr ?p ?o . FILTER(?p != owl:equivalentClass) }
+              OPTIONAL {
+                ?dr owl:withRestrictions ?list .
+                ?list (rdf:rest*)/rdf:first ?facet .
+                ?facet ?fp ?fo .
+                ?list ?lp ?lo .
+              }
+            }
+            """.formatted(datatypeIri, datatypeIri);
+    }
+
+    private String buildDatatypeRestrictionSparql(String subjectIri, String expression, String predicate) {
+        Matcher matcher = DATATYPE_RESTRICTION_EXPR.matcher(expression.trim());
+        if (!matcher.matches()) {
+            return "";
+        }
+        String datatypeIri = resolvePrefixedIri(matcher.group(1).trim());
+        String facetsRaw = matcher.group(2).trim();
+        List<DatatypeFacet> facets = parseDatatypeFacets(facetsRaw, datatypeIri);
+
+        StringBuilder insert = new StringBuilder();
+        insert.append(PREFIXES).append("INSERT DATA {\n");
+        insert.append("  <").append(subjectIri).append("> ").append(predicate).append(" _:dr .\n");
+        insert.append("  _:dr a rdfs:Datatype ;\n");
+        insert.append("       owl:onDatatype <").append(datatypeIri).append(">");
+
+        if (facets.isEmpty()) {
+            insert.append(" .\n}\n");
+            return insert.toString();
+        }
+
+        insert.append(" ;\n       owl:withRestrictions _:list0 .\n");
+        for (int i = 0; i < facets.size(); i++) {
+            DatatypeFacet facet = facets.get(i);
+            String facetNode = "_:facet" + i;
+            String currentList = "_:list" + i;
+            String nextList = (i == facets.size() - 1) ? "rdf:nil" : "_:list" + (i + 1);
+            insert.append("  ").append(currentList).append(" rdf:first ").append(facetNode).append(" ;\n");
+            insert.append("             rdf:rest ").append(nextList).append(" .\n");
+            insert.append("  ").append(facetNode).append(" <").append(facet.predicate()).append("> ");
+            insert.append("\"").append(escapeSparqlString(facet.literalValue())).append("\"");
+            if (facet.literalDatatype() != null) {
+                insert.append("^^<").append(facet.literalDatatype()).append(">");
+            }
+            insert.append(" .\n");
+        }
+        insert.append("}\n");
+        return insert.toString();
+    }
+
+    private List<DatatypeFacet> parseDatatypeFacets(String facetsRaw, String baseDatatypeIri) {
+        List<DatatypeFacet> facets = new ArrayList<>();
+        for (String part : facetsRaw.split(",")) {
+            String facetText = part.trim();
+            if (facetText.isEmpty()) continue;
+            Matcher m = FACET_PATTERN.matcher(facetText);
+            if (!m.matches()) continue;
+            String op = m.group(1);
+            String value = m.group(2).trim();
+            String predicate = switch (op) {
+                case ">=" -> "http://www.w3.org/2001/XMLSchema#minInclusive";
+                case ">" -> "http://www.w3.org/2001/XMLSchema#minExclusive";
+                case "<=" -> "http://www.w3.org/2001/XMLSchema#maxInclusive";
+                case "<" -> "http://www.w3.org/2001/XMLSchema#maxExclusive";
+                case "=" -> "http://www.w3.org/2001/XMLSchema#minInclusive";
+                default -> null;
+            };
+            if (predicate == null) continue;
+            facets.add(new DatatypeFacet(predicate, stripQuotes(value), baseDatatypeIri));
+            if ("=".equals(op)) {
+                facets.add(new DatatypeFacet(
+                        "http://www.w3.org/2001/XMLSchema#maxInclusive",
+                        stripQuotes(value),
+                        baseDatatypeIri));
+            }
+        }
+        return facets;
+    }
+
+    private String stripQuotes(String value) {
+        if (value == null) return "";
+        String v = value.trim();
+        if ((v.startsWith("\"") && v.endsWith("\"")) || (v.startsWith("'") && v.endsWith("'"))) {
+            return v.substring(1, v.length() - 1);
+        }
+        return v;
+    }
+
+    private String escapeSparqlString(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private String buildDeleteDatatypeRestrictionSparql(String propertyIri, String predicate) {
+        return PREFIXES + """
+            DELETE {
+              <%s> %s ?dr .
+              ?dr ?p ?o .
+              ?list ?lp ?lo .
+              ?facet ?fp ?fo .
+            }
+            WHERE {
+              <%s> %s ?dr .
+              ?dr a rdfs:Datatype ; owl:onDatatype ?dt .
+              OPTIONAL { ?dr ?p ?o . FILTER(?p NOT IN (rdf:type, owl:onDatatype, owl:withRestrictions)) }
+              OPTIONAL {
+                ?dr owl:withRestrictions ?list .
+                ?list (rdf:rest*)/rdf:first ?facet .
+                ?facet ?fp ?fo .
+                ?list ?lp ?lo .
+              }
+            }
+            """.formatted(propertyIri, predicate, propertyIri, predicate);
+    }
+
+    private String buildDeleteDanglingExpressionsSparql(String iri, String fillerPredicates, String anchorPredicates) {
+        return """
+            DELETE {
+              ?ancestor ?axiomPred ?root .
+              ?node ?p ?o .
+            }
+            WHERE {
+              {
+                ?restr (%s) <%s> .
+                ?root (owl:intersectionOf|owl:unionOf|owl:oneOf|rdf:first|rdf:rest)* ?restr .
+              } UNION {
+                ?listNode rdf:first <%s> .
+                ?root (owl:intersectionOf|owl:unionOf|owl:oneOf|rdf:first|rdf:rest)* ?listNode .
+              }
+              ?ancestor ?axiomPred ?root .
+              FILTER(?axiomPred IN (%s))
+              FILTER(isIRI(?ancestor))
+              # Deliberately excludes rdf:first from this path: rdf:first's object is a list MEMBER
+              # (e.g. a named class like HamTopping in a unionOf), not part of the expression's own
+              # scaffolding. Walking into it would delete that unrelated member's own declaration —
+              # only tear down the wrapper/list-cell scaffold itself (isBlank(?node) as a hard guard).
+              ?root (owl:intersectionOf|owl:unionOf|owl:oneOf|rdf:rest)* ?node .
+              FILTER(isBlank(?node))
+              ?node ?p ?o .
+            }
+            """.formatted(fillerPredicates, iri, iri, anchorPredicates);
+    }
+
+    private static final String CLASS_EXPR_FILLER_PREDICATES = "owl:someValuesFrom|owl:allValuesFrom|owl:hasValue|owl:onClass";
+    private static final String CLASS_EXPR_ANCHOR_PREDICATES = "rdfs:subClassOf, owl:equivalentClass, owl:disjointWith, rdfs:domain, rdfs:range";
+    private static final String PROPERTY_EXPR_ANCHOR_PREDICATES = "rdfs:subClassOf, owl:equivalentClass, owl:disjointWith, owl:propertyChainAxiom";
+    private static final String DATATYPE_EXPR_ANCHOR_PREDICATES = "rdfs:subClassOf, owl:equivalentClass, rdfs:range";
+
+    private String buildDeleteBlankNodeAxiomSparql(String blankNodeId, String ancestorIri) {
+        if (blankNodeId == null || blankNodeId.isBlank()) {
+            log.warn("[MUTATION] deleteAxiom requires a blank node ID");
+            return "";
+        }
+        boolean hasAncestor = ancestorIri != null && !ancestorIri.isBlank();
+        String anchorTriple = hasAncestor ? "  <" + ancestorIri + "> rdfs:subClassOf ?axiom .\n" : "";
+
+        String matchFilter;
+        if (hasAncestor) {
+
+            matchFilter = "  FILTER(isBlank(?axiom))\n";
+        } else {
+
+            String rawId = blankNodeId.startsWith("_:") ? blankNodeId.substring(2) : blankNodeId;
+            String escapedRawId = rawId.replace("\\", "\\\\").replace("\"", "\\\"");
+            matchFilter = "  FILTER(isBlank(?axiom) && STR(?axiom) = \"" + escapedRawId + "\")\n";
+        }
+
+        String sparql = """
+            DELETE {
+            %s  ?axiom ?p ?o .
+              ?listNode rdf:first ?first .
+              ?listNode rdf:rest ?rest .
+            }
+            WHERE {
+            %s%s  ?axiom ?p ?o .
+              OPTIONAL {
+                ?axiom (owl:intersectionOf|owl:unionOf|owl:oneOf|rdf:first|rdf:rest)* ?listNode .
+                ?listNode rdf:first ?first .
+                ?listNode rdf:rest ?rest .
+              }
+            }
+            """.formatted(anchorTriple, anchorTriple, matchFilter);
+        log.info("[MUTATION] deleteAxiom SPARQL for blank node {} (ancestorIri={}): {}", blankNodeId, ancestorIri, sparql);
+        return sparql;
+    }
+
+    private String buildDeleteComplexExpressionSparql(String classIri, String bnodeId, String axiomType) {
+        log.info("[MUTATION] buildDeleteComplexExpressionSparql called:");
+        log.info("[MUTATION]   classIri: {}", classIri);
+        log.info("[MUTATION]   bnodeId: {}", bnodeId);
+        log.info("[MUTATION]   axiomType: {}", axiomType);
+
+        String axiomPredicate = getAxiomPredicate(axiomType);
+
+        String sparql = """
+            DELETE {
+              <%s> %s ?expr .
+              ?expr ?exprProp ?exprValue .
+              ?listNode rdf:first ?first .
+              ?listNode rdf:rest ?rest .
+            }
+            WHERE {
+              <%s> %s ?expr .
+              ?expr ?exprProp ?exprValue .
+              OPTIONAL {
+                ?expr ?listProp ?list .
+                ?list rdf:rest* ?listNode .
+                ?listNode rdf:first ?first .
+                ?listNode rdf:rest ?rest .
+              }
+            }
+            """.formatted(classIri, axiomPredicate, classIri, axiomPredicate);
+
+        log.info("[MUTATION]   Generated delete complex expression SPARQL: {}", sparql);
+        return sparql;
+    }
+
+    private boolean isComplexExpression(String expression) {
+        if (expression == null) return false;
+        return expression.contains(" ") && !expression.trim().startsWith("<") && !expression.trim().startsWith("_:");
+    }
+
+    private java.util.List<String> collectReverseReferenceIris(String projectId, MutationOp op) {
+        String type = op.type();
+        if (type == null || !type.startsWith("delete") || op.iri() == null) {
+            return java.util.List.of();
+        }
+
+        java.util.List<String> result = new java.util.ArrayList<>();
+        String query = PREFIXES + """
+            SELECT ?p ?o WHERE { <%s> ?p ?o }
+            """.formatted(op.iri());
+        try (TupleQueryResult tqr = datasetService.execSelect(projectId, query)) {
+            while (tqr.hasNext()) {
+                BindingSet bs = tqr.next();
+                String predicate = bs.getValue("p").stringValue();
+                if (predicate.equals("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")) {
+                    continue;
+                }
+                org.eclipse.rdf4j.model.Value object = bs.getValue("o");
+                if (object instanceof org.eclipse.rdf4j.model.IRI) {
+                    result.add(object.stringValue());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[MUTATION] Could not collect reverse-reference IRIs for {}: {}", op.iri(), e.getMessage());
+        }
+        return result;
+    }
+
+    private String resolveEntity(String projectId, String name) {
+        if (name == null) return null;
+        String trimmed = name.trim();
+
+        if (trimmed.startsWith("http") || trimmed.startsWith("urn:") || trimmed.startsWith("_:")) return trimmed;
+        if (trimmed.contains(":") && !trimmed.contains(" ")) return trimmed;
+
+        String escapedName = trimmed.replace("\"", "\\\"");
+        String query = PREFIXES + """
+            SELECT ?iri WHERE {
+                ?iri rdfs:label "%s" .
+            } LIMIT 1
+            """.formatted(escapedName);
+
+        try {
+            TupleQueryResult result = datasetService.execSelect(projectId, query);
+            if (result.hasNext()) {
+                BindingSet bs = result.next();
+                return bs.getValue("iri").stringValue();
+            }
+        } catch (Exception e) {
+            log.warn("Failed to resolve entity '{}': {}", trimmed, e.getMessage());
+        }
+        return trimmed;
+    }
+
+    private String buildClassExpressionSparql(String projectId, String expression) {
+        if (!isComplexExpression(expression)) {
+
+             String trimmed = expression.trim();
+             if ((trimmed.startsWith("http") || trimmed.startsWith("urn:")) && !trimmed.startsWith("<")) {
+                 return "<" + trimmed + ">";
+             }
+             return trimmed;
+        }
+
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile("^(\\S+)\\s+(some|only)\\s+(.+)$");
+        java.util.regex.Matcher m = p.matcher(expression);
+
+        if (m.find()) {
+            String property = m.group(1);
+            String type = m.group(2);
+            String target = m.group(3);
+
+            String propertyIri = resolveEntity(projectId, property);
+            String targetIri = resolveEntity(projectId, target);
+
+            return buildRestrictionBody(propertyIri, type, targetIri, null, false);
+        }
+
+        throw new IllegalArgumentException("Unsupported complex expression: " + expression);
+    }
+
+    private String getAxiomPredicate(String axiomType) {
+        if (axiomType == null) {
+            return "rdfs:subClassOf";
+        }
+        return switch (axiomType) {
+            case "EquivalentTo" -> "owl:equivalentClass";
+            case "DisjointWith" -> "owl:disjointWith";
+            default -> "rdfs:subClassOf";
+        };
+    }
+
+    private void requireDraftCopyReady(String projectId, String userId) {
+        if (draftCopyService == null || !draftCopyService.isReady(projectId, userId)) {
+            throw new DraftNotReadyException();
+        }
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
+    public record MutationOp(
+        String type,
+        String iri,
+        String label,
+        String parent,
+        String property,
+        String value,
+        String target,
+        String classIri,
+
+        String restrictionType,
+        Integer cardinality,
+        String axiomType,
+        String oldValue,
+        String language,
+        String datatype,
+        String ancestorIri
+    ) {
+        public static MutationOp forTypeAssertion(String opType, String iri, String label) {
+            return new MutationOp(opType, iri, label, null, null, null, null, null, null, null, null, null, null, null, null);
+        }
+
+        public static MutationOp forSubClassOfChange(String opType, String iri, String label, String parentIri, boolean isAddition) {
+            return new MutationOp(opType, iri, label, parentIri, null, null, null, null, null, null, null,
+                    isAddition ? null : parentIri, null, null, null);
+        }
+
+        public static MutationOp forPropertyAssertion(String opType, String iri, String label, String property, String value) {
+            return new MutationOp(opType, iri, label, null, property, value, null, null, null, null, null, null, null, null, null);
+        }
+    }
+}

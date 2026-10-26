@@ -1,0 +1,133 @@
+import apiClient from './apiClient';
+import ontologyMutationService from './ontologyMutationService';
+import { isDesktop } from '../utils/desktop';
+import { announceMutationApplied } from '../utils/committedChange';
+
+export type ClassAxiomType = 'EquivalentTo' | 'SubClassOf' | 'DisjointWith';
+export type PropertyRelationType = 'Domain' | 'Range';
+
+function withDraftParams(params: URLSearchParams, userId?: string): URLSearchParams {
+  if (!isDesktop() && ontologyMutationService.isPrivateEditMode()) {
+    params.set('draft', 'true');
+    if (userId) params.set('userId', userId);
+  }
+  return params;
+}
+
+function announceExpressionEdit(projectId: string, type: string, iri: string, params: URLSearchParams): void {
+  announceMutationApplied(projectId, [{ type, iri }], undefined, params.get('draft') === 'true');
+}
+
+export function isSimpleOntologyIri(value: string): boolean {
+  const t = value.trim();
+  return (
+    t.startsWith('http://') ||
+    t.startsWith('https://') ||
+    t.startsWith('urn:') ||
+    /^[A-Za-z_][\w.-]*:[\w.-]+$/.test(t)
+  );
+}
+
+export function isManchesterClassExpression(value: string): boolean {
+  const t = value.trim();
+  if (!t || isSimpleOntologyIri(t) || t.startsWith('_:')) return false;
+  return true;
+}
+
+export interface ParseExpressionResult {
+  success: boolean;
+  manchester?: string;
+  type?: string;
+  isAnonymous?: boolean;
+  error?: string;
+}
+
+function unwrap(res: unknown): Record<string, unknown> {
+  if (!res || typeof res !== 'object') {
+    return {};
+  }
+  const record = res as Record<string, unknown>;
+  const data = record.data;
+  return data && typeof data === 'object' ? (data as Record<string, unknown>) : record;
+}
+
+export const expressionService = {
+  async parseExpression(projectId: string, expression: string): Promise<ParseExpressionResult> {
+    const res = await apiClient.post<ParseExpressionResult>(
+      `/api/ontology/${encodeURIComponent(projectId)}/expression/parse`,
+      { expression },
+    );
+    const payload = unwrap(res);
+    return {
+      success: payload.success !== false,
+      manchester: payload.manchester as string | undefined,
+      type: payload.type as string | undefined,
+      isAnonymous: payload.isAnonymous as boolean | undefined,
+      error: payload.error as string | undefined,
+    };
+  },
+
+  async addClassExpressionAxiom(
+    projectId: string,
+    classIri: string,
+    axiomType: ClassAxiomType,
+    expression: string,
+    userId?: string,
+    username?: string,
+  ): Promise<void> {
+    const params = new URLSearchParams();
+    if (userId) params.set('userId', userId);
+    if (username) params.set('username', username);
+    withDraftParams(params, userId);
+    const qs = params.toString();
+    await apiClient.post(
+      `/api/ontology/${encodeURIComponent(projectId)}/expression/add-class-axiom${qs ? `?${qs}` : ''}`,
+      { classIri, axiomType, expression },
+    );
+    announceExpressionEdit(projectId, 'addClassExpression', classIri, params);
+  },
+
+  async addPropertyExpressionAxiom(
+    projectId: string,
+    propertyIri: string,
+    relationType: PropertyRelationType,
+    expression: string,
+    isDataProperty: boolean,
+    userId?: string,
+    username?: string,
+  ): Promise<void> {
+    const params = new URLSearchParams();
+    if (userId) params.set('userId', userId);
+    if (username) params.set('username', username);
+    withDraftParams(params, userId);
+    const qs = params.toString();
+    await apiClient.post(
+      `/api/ontology/${encodeURIComponent(projectId)}/expression/add-property-axiom${qs ? `?${qs}` : ''}`,
+      { propertyIri, relationType, expression, isDataProperty },
+    );
+    announceExpressionEdit(projectId, `addProperty${relationType}`, propertyIri, params);
+  },
+
+  async deletePropertyExpressionAxiom(
+    projectId: string,
+    propertyIri: string,
+    relationType: PropertyRelationType,
+    expression: string,
+    isDataProperty: boolean,
+    userId?: string,
+    username?: string,
+  ): Promise<void> {
+    const params = new URLSearchParams();
+    if (userId) params.set('userId', userId);
+    if (username) params.set('username', username);
+    withDraftParams(params, userId);
+    const qs = params.toString();
+    await apiClient.post(
+      `/api/ontology/${encodeURIComponent(projectId)}/expression/delete-property-axiom${qs ? `?${qs}` : ''}`,
+      { propertyIri, relationType, expression, isDataProperty },
+    );
+    announceExpressionEdit(projectId, `deleteProperty${relationType}`, propertyIri, params);
+  },
+};
+
+export default expressionService;

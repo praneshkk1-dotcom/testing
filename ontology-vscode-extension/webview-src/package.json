@@ -1,0 +1,52 @@
+{
+  "name": "ontocode---ontology-editor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:e2e": "vite --mode e2e",
+    "dev:desktop-e2e": "vite --mode desktop-e2e --port 3002",
+    "build": "vite build",
+    "build:electron": "vite build --base ./",
+    "build:vscode": "vite build --base ./",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@stomp/stompjs": "^7.3.0",
+    "@stripe/react-stripe-js": "^6.3.0",
+    "@stripe/stripe-js": "^9.3.1",
+    "axios": "^1.12.2",
+    "d3": "^7.8.5",
+    "dompurify": "3.4.17",
+    "form-data": "^4.0.4",
+    "fs": "^0.0.1-security",
+    "lucide-react": "^0.546.0",
+    "marked": "18.0.14",
+    "path": "^0.12.7",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "sockjs-client": "^1.6.1",
+    "vis-network": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/sockjs-client": "^1.5.4",
+    "@typescript-eslint/eslint-plugin": "^8.28.0",
+    "@typescript-eslint/parser": "^8.28.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "@vitest/coverage-v8": "^5.0.5",
+    "eslint": "^9.22.0",
+    "jsdom": "^25.0.1",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0",
+    "vite-plugin-istanbul": "^7.2.1",
+    "vitest": "^5.0.5"
+  }
+}
