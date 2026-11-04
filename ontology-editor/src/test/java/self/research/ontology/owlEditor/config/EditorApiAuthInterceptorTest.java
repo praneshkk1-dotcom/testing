@@ -1,0 +1,327 @@
+package self.research.ontology.owlEditor.config;
+
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Encoders;
+import io.jsonwebtoken.security.Keys;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.servlet.HandlerMapping;
+import self.research.ontology.owlEditor.document.AssistantSessionDocument;
+import self.research.ontology.owlEditor.repository.AssistantSessionRepository;
+import self.research.ontology.owlEditor.service.JobProjectResolver;
+import self.research.ontology.owlEditor.service.ProjectAccessService;
+
+import javax.crypto.SecretKey;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class EditorApiAuthInterceptorTest {
+
+    private final SecretKey key = Jwts.SIG.HS256.key().build();
+    private ProjectAccessService projectAccessService;
+    private AssistantSessionRepository sessionRepository;
+    private JobProjectResolver jobProjectResolver;
+    private EditorApiAuthInterceptor interceptor;
+
+    @BeforeEach
+    void setUp() {
+        projectAccessService = mock(ProjectAccessService.class);
+        sessionRepository = mock(AssistantSessionRepository.class);
+        jobProjectResolver = mock(JobProjectResolver.class);
+        when(jobProjectResolver.projectIdOf(anyString())).thenReturn(Optional.empty());
+        interceptor = new EditorApiAuthInterceptor(projectAccessService, sessionRepository,
+                new JwtVerifier(Encoders.BASE64.encode(key.getEncoded())), jobProjectResolver);
+        ReflectionTestUtils.setField(interceptor, "requireJwt", true);
+        ReflectionTestUtils.setField(interceptor, "desktopMode", false);
+    }
+
+    private MockHttpServletRequest request(String method, String uri, String email) {
+        MockHttpServletRequest request = new MockHttpServletRequest(method, uri);
+        request.setRemoteAddr("10.0.0.5");
+        request.addHeader("Authorization", "Bearer " + Jwts.builder().subject(email).signWith(key).compact());
+        return request;
+    }
+
+    private void sessionOnProject(String sessionId, String projectId) {
+        when(sessionRepository.findById(sessionId))
+                .thenReturn(Optional.of(AssistantSessionDocument.builder().id(sessionId).projectId(projectId).build()));
+    }
+
+    @Test
+    void assistantToolCallOnAnotherUsersProjectIsForbidden() throws Exception {
+        sessionOnProject("s1", "proj-victim");
+        when(projectAccessService.hasProjectAccess("proj-victim", "intruder@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(
+                request("POST", "/api/v1/code-assistant/sessions/s1/tools/read_context", "intruder@x.com"),
+                response, new Object());
+
+        assertFalse(allowed);
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void assistantToolCallOnAnAccessibleProjectPasses() throws Exception {
+        sessionOnProject("s1", "proj-1");
+        when(projectAccessService.hasProjectAccess("proj-1", "owner@x.com")).thenReturn(true);
+
+        boolean allowed = interceptor.preHandle(
+                request("POST", "/api/v1/code-assistant/sessions/s1/groups/g1/apply", "owner@x.com"),
+                new MockHttpServletResponse(), new Object());
+
+        assertTrue(allowed);
+    }
+
+    @Test
+    void sessionCreateIsLeftToTheControllerWithTheVerifiedEmailRecorded() throws Exception {
+        MockHttpServletRequest request = request("POST", "/api/v1/code-assistant/sessions", "owner@x.com");
+
+        boolean allowed = interceptor.preHandle(request, new MockHttpServletResponse(), new Object());
+
+        assertTrue(allowed);
+        assertEquals("owner@x.com", request.getAttribute(EditorApiAuthInterceptor.VERIFIED_EMAIL_ATTRIBUTE));
+        verify(projectAccessService, never()).hasProjectAccess(any(), any());
+    }
+
+    @Test
+    void unknownSessionIsLeftToTheControllerToReject() throws Exception {
+        when(sessionRepository.findById("missing")).thenReturn(Optional.empty());
+
+        boolean allowed = interceptor.preHandle(
+                request("POST", "/api/v1/code-assistant/sessions/missing/propose", "owner@x.com"),
+                new MockHttpServletResponse(), new Object());
+
+        assertTrue(allowed);
+        verify(projectAccessService, never()).hasProjectAccess(any(), any());
+    }
+
+    @Test
+    void projectPathVariableStillTakesPrecedence() throws Exception {
+        MockHttpServletRequest request = request("GET", "/api/v1/code-assistant/projects/proj-2/recovery", "u@x.com");
+        request.setAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE, Map.of("projectId", "proj-2"));
+        when(projectAccessService.hasProjectAccess("proj-2", "u@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(request, response, new Object()));
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void requestWithoutATokenPassesWhenJwtIsNotRequired() throws Exception {
+        ReflectionTestUtils.setField(interceptor, "requireJwt", false);
+        MockHttpServletRequest anonymous = new MockHttpServletRequest("POST", "/api/v1/code-assistant/sessions/s1/tools/run_sparql");
+        anonymous.setRemoteAddr("10.0.0.5");
+
+        assertTrue(interceptor.preHandle(anonymous, new MockHttpServletResponse(), new Object()));
+        verify(sessionRepository, never()).findById(any());
+    }
+
+    @Test
+    void aTokenThatIsSentIsStillCheckedForProjectAccessWhenJwtIsNotRequired() throws Exception {
+        ReflectionTestUtils.setField(interceptor, "requireJwt", false);
+        sessionOnProject("s1", "proj-victim");
+        when(projectAccessService.hasProjectAccess("proj-victim", "attacker@x.com")).thenReturn(false);
+        when(projectAccessService.projectExists("proj-victim")).thenReturn(true);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(
+                request("POST", "/api/v1/code-assistant/sessions/s1/tools/run_sparql", "attacker@x.com"),
+                response, new Object()));
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void aProjectThatDoesNotExistYetCanBeCreatedWhenJwtIsNotRequired() throws Exception {
+        ReflectionTestUtils.setField(interceptor, "requireJwt", false);
+        MockHttpServletRequest upload = request("POST", "/api/ontology/upload/new-proj", "dev@x.com");
+        upload.setAttribute(org.springframework.web.servlet.HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE,
+                java.util.Map.of("projectId", "new-proj"));
+
+        assertTrue(interceptor.preHandle(upload, new MockHttpServletResponse(), new Object()));
+    }
+
+    @Test
+    void aProjectThatDoesNotExistIsStillRefusedWhenJwtIsRequired() throws Exception {
+        MockHttpServletRequest upload = request("POST", "/api/ontology/upload/new-proj", "dev@x.com");
+        upload.setAttribute(org.springframework.web.servlet.HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE,
+                java.util.Map.of("projectId", "new-proj"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(upload, response, new Object()));
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void aForgedTokenIsRejectedWhenJwtIsNotRequired() throws Exception {
+        ReflectionTestUtils.setField(interceptor, "requireJwt", false);
+        MockHttpServletRequest forged = new MockHttpServletRequest("POST", "/api/v1/code-assistant/sessions/s1/tools/run_sparql");
+        forged.setRemoteAddr("10.0.0.5");
+        forged.addHeader("Authorization", "Bearer "
+                + Jwts.builder().subject("victim@x.com").signWith(Jwts.SIG.HS256.key().build()).compact());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(forged, response, new Object()));
+        assertEquals(401, response.getStatus());
+    }
+
+    private MockHttpServletRequest requestWithUserId(String method, String uri, String email, String userId) {
+        MockHttpServletRequest request = new MockHttpServletRequest(method, uri);
+        request.setRemoteAddr("10.0.0.5");
+        request.addHeader("Authorization", "Bearer "
+                + Jwts.builder().subject(email).claim("userId", userId).signWith(key).compact());
+        return request;
+    }
+
+    @Test
+    void aTokenWithAUserIdIsCheckedAgainstTheProjectByUserId() throws Exception {
+        sessionOnProject("s1", "proj-1");
+        when(projectAccessService.hasProjectAccess("proj-1", "u-1", "owner@x.com")).thenReturn(true);
+        MockHttpServletRequest request = requestWithUserId("POST",
+                "/api/v1/code-assistant/sessions/s1/tools/read_context", "owner@x.com", "u-1");
+
+        boolean allowed = interceptor.preHandle(request, new MockHttpServletResponse(), new Object());
+
+        assertTrue(allowed);
+        assertEquals("u-1", request.getAttribute(EditorApiAuthInterceptor.VERIFIED_USER_ID_ATTRIBUTE));
+    }
+
+    @Test
+    void aTokenWithAUserIdThatHasNoAccessIsForbidden() throws Exception {
+        sessionOnProject("s1", "proj-1");
+        when(projectAccessService.hasProjectAccess("proj-1", "u-9", "intruder@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(requestWithUserId("POST",
+                "/api/v1/code-assistant/sessions/s1/tools/read_context", "intruder@x.com", "u-9"), response, new Object());
+
+        assertFalse(allowed);
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void aDlQueryJobOfAnotherProjectIsForbidden() throws Exception {
+        when(jobProjectResolver.projectIdOf("/api/dl-query/jobs/j1")).thenReturn(Optional.of("proj-victim"));
+        when(projectAccessService.hasProjectAccess("proj-victim", "intruder@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        boolean allowed = interceptor.preHandle(request("GET", "/api/dl-query/jobs/j1", "intruder@x.com"), response,
+                new Object());
+
+        assertFalse(allowed);
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void aJobOfAProjectTheCallerCanAccessPasses() throws Exception {
+        when(jobProjectResolver.projectIdOf("/api/dl-query/jobs/j1")).thenReturn(Optional.of("proj-1"));
+        when(projectAccessService.hasProjectAccess("proj-1", "owner@x.com")).thenReturn(true);
+
+        assertTrue(interceptor.preHandle(request("GET", "/api/dl-query/jobs/j1", "owner@x.com"),
+                new MockHttpServletResponse(), new Object()));
+    }
+
+    private MockHttpServletRequest ownerUpload(String projectId, String ownerEmail, String tokenEmail, boolean admin) {
+        MockHttpServletRequest upload = new MockHttpServletRequest("POST", "/api/ontology/upload/" + projectId);
+        upload.setRemoteAddr("10.0.0.5");
+        upload.setParameter("ownerEmail", ownerEmail);
+        upload.setAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE, Map.of("projectId", projectId));
+        if (tokenEmail != null) {
+            upload.addHeader("Authorization", "Bearer "
+                    + Jwts.builder().subject(tokenEmail).claim("isAdmin", admin).signWith(key).compact());
+        }
+        return upload;
+    }
+
+    @Test
+    void ownerUploadWithoutATokenIsRefusedWhenJwtIsRequired() throws Exception {
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(ownerUpload("p1", "a@x.com", null, false), response, new Object()));
+        assertEquals(401, response.getStatus());
+    }
+
+    @Test
+    void ownerUploadWithAForgedTokenIsRefused() throws Exception {
+        MockHttpServletRequest upload = ownerUpload("p1", "a@x.com", null, false);
+        upload.addHeader("Authorization", "Bearer "
+                + Jwts.builder().subject("a@x.com").signWith(Jwts.SIG.HS256.key().build()).compact());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(upload, response, new Object()));
+        assertEquals(401, response.getStatus());
+    }
+
+    @Test
+    void ownerUploadOfANewProjectForTheTokenUserIsAllowed() throws Exception {
+        when(projectAccessService.projectExists("fresh")).thenReturn(false);
+
+        assertTrue(interceptor.preHandle(ownerUpload("fresh", "a@x.com", "A@x.com", false),
+                new MockHttpServletResponse(), new Object()));
+    }
+
+    @Test
+    void aJobOfAnotherProjectIsForbiddenEvenWhenThePathProjectIsTheCallers() throws Exception {
+        when(jobProjectResolver.projectIdOf("/api/ontology/proj-mine/reasoner/jobs/j1"))
+                .thenReturn(Optional.of("proj-victim"));
+        when(projectAccessService.hasProjectAccess("proj-mine", "mallory@x.com")).thenReturn(true);
+        when(projectAccessService.hasProjectAccess("proj-victim", "mallory@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockHttpServletRequest request = request("GET", "/api/ontology/proj-mine/reasoner/jobs/j1", "mallory@x.com");
+        request.setAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE, Map.of("projectId", "proj-mine"));
+
+        boolean allowed = interceptor.preHandle(request, response, new Object());
+
+        assertFalse(allowed);
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void ownerUploadOnBehalfOfSomeoneElseIsForbidden() throws Exception {
+        when(projectAccessService.projectExists("fresh")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(ownerUpload("fresh", "victim@x.com", "a@x.com", false), response, new Object()));
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void adminMayUploadOnBehalfOfSomeoneElse() throws Exception {
+        when(projectAccessService.projectExists("fresh")).thenReturn(false);
+
+        assertTrue(interceptor.preHandle(ownerUpload("fresh", "user@x.com", "admin@x.com", true),
+                new MockHttpServletResponse(), new Object()));
+    }
+
+    @Test
+    void ownerUploadIntoAnExistingProjectWithoutAccessIsForbidden() throws Exception {
+        when(projectAccessService.projectExists("taken")).thenReturn(true);
+        when(projectAccessService.hasProjectAccess("taken", "a@x.com")).thenReturn(false);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        assertFalse(interceptor.preHandle(ownerUpload("taken", "a@x.com", "a@x.com", false), response, new Object()));
+        assertEquals(403, response.getStatus());
+    }
+
+    @Test
+    void desktopLoopbackOwnerUploadNeedsNoToken() throws Exception {
+        ReflectionTestUtils.setField(interceptor, "desktopMode", true);
+        MockHttpServletRequest upload = ownerUpload("p1", "a@x.com", null, false);
+        upload.setRemoteAddr("127.0.0.1");
+
+        assertTrue(interceptor.preHandle(upload, new MockHttpServletResponse(), new Object()));
+    }
+}

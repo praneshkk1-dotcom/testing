@@ -1,0 +1,20 @@
+package self.research.ontology.owlEditor.model.merge;
+
+public enum ConflictType {
+
+    DIFFERENT_DEFINITION,
+
+    DIFFERENT_ASSERTIONS,
+
+    INCOMPATIBLE_AXIOMS,
+
+    INCOMPATIBLE_PROPERTY_CONSTRAINTS,
+
+    NAMESPACE_CONFLICT,
+
+    ONTOLOGY_IRI_CONFLICT,
+
+    DUPLICATE_FILE_CONTENT,
+
+    IDENTICAL_FILE_UPLOAD
+}

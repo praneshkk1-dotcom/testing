@@ -1,0 +1,136 @@
+package self.research.ontology.owlEditor.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import self.research.ontology.owlEditor.model.DraftCopyStatus;
+import self.research.ontology.owlEditor.model.DraftSession;
+import self.research.ontology.owlEditor.repository.DraftSessionRepository;
+
+import java.time.LocalDateTime;
+
+@Slf4j
+@Service
+public class DraftCopyService {
+
+    private final SparqlDatasetService datasetService;
+    private final DraftSessionRepository sessionRepository;
+    private final MainGraphRevisionService revisionService;
+    private final ImportQueueManager importQueueManager;
+    private final DraftPublishMergeService publishMergeService;
+
+    public DraftCopyService(SparqlDatasetService datasetService,
+                            DraftSessionRepository sessionRepository,
+                            MainGraphRevisionService revisionService,
+                            ImportQueueManager importQueueManager,
+                            DraftPublishMergeService publishMergeService) {
+        this.datasetService = datasetService;
+        this.sessionRepository = sessionRepository;
+        this.revisionService = revisionService;
+        this.importQueueManager = importQueueManager;
+        this.publishMergeService = publishMergeService;
+    }
+
+    public record InitiateResult(
+            boolean accepted,
+            String reason,
+            long tripleCount,
+            long mainRevisionAtCopy
+    ) {}
+
+    public InitiateResult initiateCopy(String projectId, String userId) {
+        if (isReady(projectId, userId)) {
+            long existingRevision = getMainRevisionAtCopy(projectId, userId);
+            log.info("[DRAFT-COPY] Resuming existing ready draft session for project {} user {} (baseline revision {}) — not re-copying, would discard pending draft edits",
+                    projectId, userId, existingRevision);
+            return new InitiateResult(true, "Resumed existing draft session", -1, existingRevision);
+        }
+
+        if (getStatus(projectId, userId) == DraftCopyStatus.COPYING) {
+            return new InitiateResult(false,
+                    "A draft copy is already in progress for this project — please wait for it to finish.", 0, 0);
+        }
+
+        var stats = importQueueManager.getQueueStats();
+        if (stats.getActiveProjectIds() != null && stats.getActiveProjectIds().contains(projectId)) {
+            return new InitiateResult(false,
+                    "An import is in progress for this project. Please wait until it finishes before switching to draft mode.",
+                    0, 0);
+        }
+
+        long tripleCount = datasetService.countMainGraphTriples(projectId);
+        long revision = revisionService.getRevision(projectId);
+
+        DraftSession session = sessionRepository.findByProjectIdAndUserId(projectId, userId)
+                .orElseGet(() -> new DraftSession(projectId, userId, revision, tripleCount));
+        session.setBaselineMainRevision(revision);
+        session.setBaselineMainTripleCount(tripleCount);
+        session.setBaselineAt(LocalDateTime.now());
+        session.setCopyStatus(DraftCopyStatus.COPYING);
+        try {
+
+            session.setBaselineSnapshotPath(publishMergeService.captureBaselineSnapshot(projectId, userId));
+        } catch (Exception e) {
+            log.warn("[DRAFT-COPY] Could not capture baseline snapshot for project {} user {}: {}",
+                    projectId, userId, e.getMessage());
+        }
+        sessionRepository.save(session);
+
+ try {
+            datasetService.clearDraftGraph(projectId, userId);
+            if (tripleCount == 0) {
+                updateStatus(projectId, userId, DraftCopyStatus.READY);
+            } else {
+                executeGraphCopyAsync(projectId, userId);
+            }
+        } catch (RuntimeException e) {
+            log.error("[DRAFT-COPY] Failed to initiate copy for project {} user {} — marking session FAILED",
+                    projectId, userId, e);
+            updateStatus(projectId, userId, DraftCopyStatus.FAILED);
+            throw e;
+        }
+
+        log.info("[DRAFT-COPY] Initiated copy for project {} user {} — {} triples, revision {}",
+                projectId, userId, tripleCount, revision);
+        return new InitiateResult(true, null, tripleCount, revision);
+    }
+
+    @Async("draftCopyExecutor")
+    void executeGraphCopyAsync(String projectId, String userId) {
+        try {
+            datasetService.copyMainGraphToDraft(projectId, userId);
+            updateStatus(projectId, userId, DraftCopyStatus.READY);
+            log.info("[DRAFT-COPY] Copy complete for project {} user {}", projectId, userId);
+        } catch (Exception e) {
+            log.error("[DRAFT-COPY] Copy failed for project {} user {}", projectId, userId, e);
+            updateStatus(projectId, userId, DraftCopyStatus.FAILED);
+        }
+    }
+
+    public DraftCopyStatus getStatus(String projectId, String userId) {
+        return sessionRepository.findByProjectIdAndUserId(projectId, userId)
+                .map(s -> s.getCopyStatus() != null ? s.getCopyStatus() : DraftCopyStatus.NOT_FOUND)
+                .orElse(DraftCopyStatus.NOT_FOUND);
+    }
+
+    public boolean isReady(String projectId, String userId) {
+        return sessionRepository.findByProjectIdAndUserId(projectId, userId)
+                .map(s -> s.getCopyStatus() == DraftCopyStatus.READY)
+                .orElse(false);
+    }
+
+    public long getMainRevisionAtCopy(String projectId, String userId) {
+        return sessionRepository.findByProjectIdAndUserId(projectId, userId)
+                .map(DraftSession::getBaselineMainRevision)
+                .orElse(-1L);
+    }
+
+    private void updateStatus(String projectId, String userId, DraftCopyStatus status) {
+        sessionRepository.findByProjectIdAndUserId(projectId, userId).ifPresent(s -> {
+            s.setCopyStatus(status);
+            sessionRepository.save(s);
+        });
+
+        datasetService.evictDraftReadyCache(projectId, userId);
+    }
+}

@@ -1,0 +1,3291 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { 
+  Plus, Trash2, Play, Save, Check, X, AlertCircle, Loader2, 
+  ChevronDown, ChevronRight, ChevronUp, Copy, Download, Upload, BarChart2, 
+  BookOpen, Search, ToggleLeft, ToggleRight, Zap, FileText,
+  Info, Code, List, Filter, RefreshCw, Settings, LayoutTemplate,
+  HelpCircle, Maximize2, Minimize2, Eye, EyeOff, Sparkles
+} from 'lucide-react';
+import apiClient from './apiClient';
+import { ExplainPanel, WhyNotPanel } from './ExplainPanel';
+import { toExplainFact } from './explainText';
+import { useUndoRefresh } from './useUndoRefresh';
+import RuleBuilder from './RuleBuilder';
+import { rt, btn } from './resultsTheme';
+import { ControlPanel, useControlSession } from './ControlPanel';
+import type { AddOutcome } from './ControlPanel';
+import { SWRL_BUILTINS, SWRL_BUILTINS_QUICK, BUILT_IN_PREFIXES } from './builtinCatalog';
+import { AssertedAxiomsPanel, Owl2RlPanel } from './AxiomPanels';
+import { sqwrlMeta, localPage, pageKey, sqwrlRowsPath, nextSort, sortArrow, clampPage, pageCount, showingText, resultsLine, truncationNotice, buildCsv, buildTsv, formatNumber, filterRows, sortRows, SQWRL_EXPIRED_MESSAGE, SQWRL_PAGE_SIZES, SQWRL_DEFAULT_PAGE_SIZE, SQWRL_FILTER_DEBOUNCE_MS } from './sqwrlModel';
+import type { SqwrlSort } from './sqwrlModel';
+import type { SwrlRule, UnmigratedRule, ValidationResult as SwrlValidationResult, ExecutionResponse, PluginContext, SqwrlQueryResponse, InferredAxiom, AxiomsPageResponse } from './types';
+import { withDraft, normalizeRulesResponse, unmigratedNotice, hasDisabledRule, isImportedRule, sourceLabel, localCopyBody, cloneRuleBody, ruleWriteBody, friendlyRuleError, applySavedRule, ruleFromResponse, needsValidation, importSessionFor, importSummaryLine, importButtonLabel, canRunImport, importOutcomeNotice, staleImportReport, importErrorMessage, isImportFile, skippedRowsView, isPagedRun, derivedSummary, formatCount, nextOffset, previousOffset, pageRangeText, pageCacheKey, axiomsPagePath, toggleSelection, addToSelection, allSelected, isExpiredRunError, pageErrorMessage, RESULTS_PAGE_SIZE, EXPIRED_RUN_MESSAGE, isSqwrlRule, inferredTotal, ruleTitle, INFERRED_NOTE, ADD_INFERRED_CAP, axiomsToOps, collectInferredAxioms, inferredPlan, resultCounts, resultHeading, searchMatchText, cutoffNote, showMoreLabel, countLabel, sectionTotal, groupLabel, groupTotal, ResultFilter } from './ruleModel';
+import type { AxiomKind, FactOp } from './ruleModel';
+import type { ImportReport, ImportSession } from './ruleModel';
+
+
+function parseSwrlError(raw: string): { title: string; detail: string; hint?: string } {
+  const builtInMatch = raw.match(/built-in (swrlb:\w+)/);
+  const builtIn = builtInMatch ? builtInMatch[1] : null;
+
+  const plainLiteralMatch = raw.match(/got "([^"]+)"\^\^rdf:PlainLiteral/);
+  if (plainLiteralMatch) {
+    return {
+      title: `Type error${builtIn ? ` in ${builtIn}` : ''}`,
+      detail: `Value "${plainLiteralMatch[1]}" has no datatype (stored as plain literal).`,
+      hint: 'The property\'s range is declared as xsd:string or has no range. Change it to xsd:integer or xsd:decimal for numeric comparisons, and re-save the individual\'s value.',
+    };
+  }
+
+  const stringTypeMatch = raw.match(/got "([^"]+)"\^\^xsd:string/);
+  if (stringTypeMatch) {
+    return {
+      title: `Type error${builtIn ? ` in ${builtIn}` : ''}`,
+      detail: `Value "${stringTypeMatch[1]}" is a string but a numeric type is required.`,
+      hint: 'Change the property\'s range from xsd:string to xsd:integer or xsd:decimal.',
+    };
+  }
+
+  const unsupportedMatch = raw.match(/unsupported argument type[^:]*expecting ([^,\]]+(?:,\s*[^,\]]+)*?)(?:,\s*or\s+[^,\]]+)?,?\s*got ([^\]]+)/);
+  if (unsupportedMatch) {
+    return {
+      title: `Type mismatch${builtIn ? ` in ${builtIn}` : ''}`,
+      detail: `Got ${unsupportedMatch[2].trim()}. Expected: ${unsupportedMatch[1].trim()}.`,
+      hint: 'Check that the property\'s range declaration matches the type expected by the built-in.',
+    };
+  }
+
+  if (raw.toLowerCase().includes('parse') || raw.toLowerCase().includes('syntax')) {
+    return {
+      title: 'Rule syntax error',
+      detail: raw.split(':').pop()?.trim() ?? raw,
+      hint: 'Check your SWRL expression for typos. Use the Templates panel for valid examples.',
+    };
+  }
+
+  const inner = raw
+    .replace(/^.*?TargetSWRLRuleEngineException[^:]*:\s*/i, '')
+    .replace(/^.*?error running Drools rule engine[^:]*:\s*/i, '')
+    .replace(/\[Error:.*?built-in exception thrown[^:]*:[^:]*:\s*/i, '')
+    .replace(/\[Near\s*:\s*\{.*$/s, '')
+    .replace(/\^\s*\[Line:.*$/s, '')
+    .trim();
+  return {
+    title: 'Execution failed',
+    detail: inner || raw.slice(0, 300),
+  };
+}
+
+const RULE_TEMPLATES = [
+  {
+    name: 'Class Membership (numeric)',
+    template: 'ClassName(?x) ^ dataProperty(?x, ?val) ^ swrlb:greaterThan(?val, 18) -> TargetClass(?x)',
+    description: 'Classify by numeric data property — replace ClassName, dataProperty, TargetClass',
+  },
+  {
+    name: 'Class Membership (string)',
+    template: 'ClassName(?x) ^ dataProperty(?x, ?val) ^ swrlb:startsWith(?val, "prefix") -> TargetClass(?x)',
+    description: 'Classify by string data property prefix — replace ClassName, dataProperty, TargetClass',
+  },
+  {
+    name: 'Property chain (2 hops)',
+    template: 'objProperty1(?x, ?y) ^ objProperty2(?y, ?z) -> inferredProperty(?x, ?z)',
+    description: 'Infer a relationship through two object property hops',
+  },
+  {
+    name: 'Sibling / co-member',
+    template: 'objProperty(?x, ?shared) ^ objProperty(?y, ?shared) ^ swrlb:notEqual(?x, ?y) -> inferredProperty(?x, ?y)',
+    description: 'Infer a relationship between two individuals that share a common value',
+  },
+  {
+    name: 'Arithmetic on data property',
+    template: 'ClassName(?x) ^ dataProperty(?x, ?a) ^ dataProperty2(?x, ?b) ^ swrlb:add(?result, ?a, ?b) -> resultProperty(?x, ?result)',
+    description: 'Compute sum of two numeric properties — property range must be xsd:integer or xsd:decimal',
+  },
+  {
+    name: 'String concat',
+    template: 'ClassName(?x) ^ firstName(?x, ?f) ^ lastName(?x, ?l) ^ swrlb:stringConcat(?full, ?f, " ", ?l) -> fullName(?x, ?full)',
+    description: 'Combine two string data properties into one',
+  },
+];
+
+const extractLocalName = (uri: string): string => {
+  if (!uri) return uri;
+  const cleanUri = uri.replace(/^<|>$/g, '');
+  const hashIndex = cleanUri.lastIndexOf('#');
+  if (hashIndex !== -1) return cleanUri.substring(hashIndex + 1);
+  const slashIndex = cleanUri.lastIndexOf('/');
+  if (slashIndex !== -1) return cleanUri.substring(slashIndex + 1);
+  return uri;
+};
+
+type OntologySchemaNames = {
+  classes: Set<string>;
+  objectProperties: Set<string>;
+  dataProperties: Set<string>;
+};
+
+const isBuiltinPredicate = (predicate: string) => {
+  const prefix = predicate.includes(':') ? predicate.split(':')[0] : '';
+  return BUILT_IN_PREFIXES.has(prefix);
+};
+
+const predicateLocalName = (predicate: string) => extractLocalName(predicate.split(':').pop() || predicate);
+
+const extractTemplatePredicates = (template: string): string[] => {
+  const predicates = new Set<string>();
+  const atomRegex = /([A-Za-z_][\w:.-]*)\s*\(/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = atomRegex.exec(template)) !== null) {
+    const predicate = match[1];
+    if (!predicate.startsWith('?') && !isBuiltinPredicate(predicate)) {
+      predicates.add(predicateLocalName(predicate));
+    }
+  }
+
+  return Array.from(predicates);
+};
+
+const templateMatchesOntology = (template: string, schema: OntologySchemaNames) => {
+  const validPredicates = new Set([
+    ...schema.classes,
+    ...schema.objectProperties,
+    ...schema.dataProperties,
+  ]);
+
+  return extractTemplatePredicates(template).every(predicate => validPredicates.has(predicate));
+};
+
+function useDebounce<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => { 
+    const t = setTimeout(() => setDebounced(value), delay); 
+    return () => clearTimeout(t); 
+  }, [value, delay]);
+  return debounced;
+}
+
+
+const ConfirmDialog: React.FC<{
+  isOpen: boolean;
+  title: string;
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  confirmText?: string;
+  danger?: boolean;
+}> = ({ isOpen, title, message, onConfirm, onCancel, confirmText = 'Confirm', danger = false }) => {
+  if (!isOpen) return null;
+  
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm" style={{ backgroundColor: 'var(--overlay)' }}>
+      <div className="rounded-xl shadow-2xl max-w-md w-full mx-4 overflow-hidden animate-in fade-in zoom-in-95 duration-200" style={{ backgroundColor: 'var(--surface-1)' }}>
+        <div className="p-5" style={{ borderBottom: '1px solid var(--border)' }}>
+          <h3 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>{title}</h3>
+        </div>
+        <div className="p-5">
+          <p style={{ color: 'var(--text-secondary)' }}>{message}</p>
+        </div>
+        <div className="flex justify-end gap-3 p-4" style={{ backgroundColor: 'var(--surface-2)' }}>
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 text-sm font-medium rounded-lg transition-colors"
+            style={{ color: 'var(--text-primary)', backgroundColor: 'var(--surface-1)', border: '1px solid var(--border)' }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-4 py-2 text-sm font-medium rounded-lg transition-colors"
+            style={{
+              backgroundColor: danger ? 'var(--error)' : '#8b5cf6',
+              color: danger ? 'var(--on-error)' : '#ffffff'
+            }}
+          >
+            {confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+interface RuleListItemProps {
+  rule: SwrlRule;
+  isSelected: boolean;
+  isChecked: boolean;
+  onSelect: () => void;
+  onToggle: () => void;
+  onToggleEnabled: () => void;
+  onDelete: () => void;
+  onMakeLocalCopy: () => void;
+  isCopying: boolean;
+  busyAction?: 'delete' | 'toggle' | 'copy' | null;
+}
+
+const RuleListItem: React.FC<RuleListItemProps> = ({ 
+  rule, isSelected, isChecked, onSelect, onToggle, onToggleEnabled, onDelete, onMakeLocalCopy, isCopying, busyAction = null
+}) => {
+  const busy = busyAction !== null;
+  const imported = isImportedRule(rule);
+  const { title, tooltip } = ruleTitle(rule);
+  return (
+  <div
+    className={`group relative flex items-start gap-3 p-3 cursor-pointer transition-all duration-150 border-l-3 ${
+      isSelected 
+        ? 'bg-purple-50 border-l-purple-500' 
+        : isChecked 
+          ? 'bg-green-50/50 border-l-green-400' 
+          : 'border-l-transparent hover:bg-gray-50'
+    }`}
+    onClick={onSelect}
+  >
+    <div className="pt-0.5" onClick={e => e.stopPropagation()}>
+      <input
+        type="checkbox"
+        checked={isChecked}
+        onChange={onToggle}
+        className="w-4 h-4 rounded border-gray-300 text-green-600 focus:ring-green-500 cursor-pointer"
+      />
+    </div>
+
+    <div className="flex-1 min-w-0">
+      <div className="flex items-center gap-2">
+        <span className={`font-medium text-sm truncate ${isSelected ? 'text-purple-900' : 'text-gray-800'}`} title={tooltip}>
+          {title}
+        </span>
+        {rule.category && (
+          <span className="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 rounded">
+            {rule.category}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-gray-500 font-mono truncate mt-0.5">{rule.ruleText}</p>
+      {imported && (
+        <div className="mt-1" onClick={e => e.stopPropagation()}>
+          <div className="text-[11px] text-gray-600 truncate" title={sourceLabel(rule)}>{sourceLabel(rule)}</div>
+          <button
+            onClick={onMakeLocalCopy}
+            disabled={isCopying || busy}
+            className="mt-0.5 text-xs text-purple-700 hover:underline disabled:opacity-50"
+          >
+            {isCopying ? 'Copying...' : 'Make a local copy'}
+          </button>
+          <div className="text-[10px] text-gray-400">Imported rules cannot be turned off here yet.</div>
+        </div>
+      )}
+    </div>
+
+    {!imported && (
+    <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
+      <button
+        onClick={onToggleEnabled}
+        disabled={busy}
+        className={`p-1.5 rounded-md transition-colors ${
+          rule.enabled 
+            ? 'bg-green-100 text-green-600 hover:bg-green-200' 
+            : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
+        }`}
+        title={rule.enabled ? 'Enabled - Click to disable' : 'Disabled - Click to enable'}
+      >
+        {busyAction === 'toggle' ? <Loader2 size={14} className="animate-spin" /> : rule.enabled ? <ToggleRight size={14} /> : <ToggleLeft size={14} />}
+      </button>
+      <button
+        onClick={onDelete}
+        disabled={busy}
+        className="p-1.5 rounded-md text-gray-500 hover:text-red-600 hover:bg-red-50 opacity-60 group-hover:opacity-100 disabled:opacity-60 disabled:hover:bg-transparent transition-all flex items-center gap-1 text-xs"
+        title="Delete rule"
+      >
+        {busyAction === 'delete' ? <><Loader2 size={14} className="animate-spin" /> Deleting…</> : <Trash2 size={14} />}
+      </button>
+    </div>
+    )}
+  </div>
+  );
+};
+
+
+interface QuickInsertProps {
+  onInsert: (text: string) => void;
+  disabled?: boolean;
+  dynamicTemplates?: typeof RULE_TEMPLATES;
+  generalTemplates?: typeof RULE_TEMPLATES;
+  schemaLoaded?: boolean;
+}
+
+const QuickInsertPanel: React.FC<QuickInsertProps> = ({
+  onInsert,
+  disabled,
+  dynamicTemplates = [],
+  generalTemplates = RULE_TEMPLATES,
+  schemaLoaded = false
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [showGeneralTemplates, setShowGeneralTemplates] = useState(false);
+  
+  return (
+    <div className="bg-gray-50 border-t border-gray-200">
+      <div className="flex items-center gap-1 p-2 flex-wrap">
+        <span className="text-xs text-gray-500 mr-2">Quick:</span>
+        {['(?x)', '(?y)', ' ^ ', ' -> '].map(sym => (
+          <button
+            key={sym}
+            onClick={() => onInsert(sym)}
+            disabled={disabled}
+            className="px-2 py-1 text-xs font-mono bg-white border border-gray-300 rounded hover:bg-purple-50 hover:border-purple-300 disabled:opacity-50 transition-colors"
+          >
+            {sym === ' ^ ' ? '∧ AND' : sym === ' -> ' ? '→ THEN' : sym}
+          </button>
+        ))}
+        
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => { setShowTemplates(!showTemplates); setExpanded(false); }}
+            className={`px-2 py-1 text-xs rounded flex items-center gap-1 transition-colors ${showTemplates ? 'bg-purple-100 text-purple-700' : 'text-purple-600 hover:bg-purple-50'}`}
+          >
+            <LayoutTemplate size={12} /> Templates {dynamicTemplates.length > 0 && <span className="text-[10px] bg-green-500 text-white px-1 rounded">{dynamicTemplates.length}</span>}
+          </button>
+          <button
+            onClick={() => { setExpanded(!expanded); setShowTemplates(false); }}
+            className={`px-2 py-1 text-xs rounded flex items-center gap-1 transition-colors ${expanded ? 'bg-purple-100 text-purple-700' : 'text-purple-600 hover:bg-purple-50'}`}
+          >
+            <Code size={12} /> Built-ins
+          </button>
+        </div>
+      </div>
+
+      {showTemplates && (
+        <div className="p-2 pt-0 space-y-2 max-h-80 overflow-y-auto">
+          {dynamicTemplates.length > 0 ? (
+            <div>
+              <div className="text-[10px] font-semibold text-green-700 uppercase tracking-wide px-2 py-1 bg-green-50 rounded flex items-center justify-between">
+                <div className="flex items-center gap-1">
+                  <Sparkles size={10} /> Ontology-Based Templates ({dynamicTemplates.length})
+                </div>
+                <span className="text-[9px] text-green-600 normal-case">From your OWL file</span>
+              </div>
+              <div className="grid grid-cols-1 gap-1 mt-1">
+                {dynamicTemplates.map((t, i) => (
+                  <button
+                    key={`dyn-${i}`}
+                    onClick={() => { onInsert(t.template); setShowTemplates(false); }}
+                    disabled={disabled}
+                    className="text-left px-3 py-2 text-xs bg-green-50 border border-green-200 rounded hover:bg-green-100 hover:border-green-300 disabled:opacity-50 group transition-colors"
+                  >
+                    <div className="font-medium text-green-800 group-hover:text-green-900">{t.name}</div>
+                    <div className="text-[10px] text-green-600 truncate">{t.description}</div>
+                  </button>
+                ))}
+              </div>
+              
+              <div className="mt-3">
+                <button
+                  onClick={() => setShowGeneralTemplates(!showGeneralTemplates)}
+                  className="w-full text-[10px] font-semibold text-purple-700 uppercase tracking-wide px-2 py-1 bg-purple-50 rounded flex items-center justify-between hover:bg-purple-100 transition-colors"
+                >
+                  <span>Syntax Patterns ({generalTemplates.length})</span>
+                  {showGeneralTemplates ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                </button>
+                {showGeneralTemplates && (
+                  <div className="grid grid-cols-1 gap-1 mt-1">
+                    {generalTemplates.length > 0 ? generalTemplates.map((t, i) => (
+                      <button
+                        key={i}
+                        onClick={() => { onInsert(t.template); setShowTemplates(false); }}
+                        disabled={disabled}
+                        className="text-left px-3 py-2 text-xs bg-white border border-gray-200 rounded hover:bg-purple-50 hover:border-purple-300 disabled:opacity-50 group transition-colors"
+                      >
+                        <div className="font-medium text-gray-700 group-hover:text-purple-700">{t.name}</div>
+                        <div className="text-[10px] text-gray-500 truncate">{t.description}</div>
+                      </button>
+                    )) : (
+                      <div className="px-3 py-2 text-xs text-gray-500 bg-white border border-gray-200 rounded">
+                        No general templates match this ontology schema yet.
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="text-[10px] font-semibold text-purple-700 uppercase tracking-wide px-2 py-1 bg-purple-50 rounded">
+                Syntax Patterns ({generalTemplates.length})
+              </div>
+              <div className="px-2 py-1.5 text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded mt-1">
+                ⚠ These are syntax blueprints. Replace <code className="bg-amber-100 px-0.5 rounded">ClassName</code>, <code className="bg-amber-100 px-0.5 rounded">dataProperty</code> etc. with names from your ontology before running.
+              </div>
+              <div className="grid grid-cols-1 gap-1 mt-1">
+                {generalTemplates.map((t, i) => (
+                  <button
+                    key={i}
+                    onClick={() => { onInsert(t.template); setShowTemplates(false); }}
+                    disabled={disabled}
+                    className="text-left px-3 py-2 text-xs bg-white border border-gray-200 rounded hover:bg-purple-50 hover:border-purple-300 disabled:opacity-50 group transition-colors"
+                  >
+                    <div className="font-medium text-gray-700 group-hover:text-purple-700">{t.name}</div>
+                    <div className="text-[10px] text-gray-500 truncate">{t.description}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {expanded && (
+        <div className="p-2 pt-0 space-y-2">
+          {SWRL_BUILTINS_QUICK.map(cat => (
+            <div key={cat.category}>
+              <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">{cat.category}</div>
+              <div className="flex flex-wrap gap-1">
+                {cat.items.map(item => (
+                  <button
+                    key={item}
+                    onClick={() => onInsert(item + '(')}
+                    disabled={disabled}
+                    className="px-2 py-0.5 text-[11px] font-mono bg-white border border-gray-200 rounded hover:bg-purple-50 hover:border-purple-300 disabled:opacity-50"
+                  >
+                    {item.split(':')[1]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+interface ResultsPanelProps {
+  results: ExecutionResponse | null;
+  isExecuting: boolean;
+}
+
+
+const SQWRLQueryPanel: React.FC<{ projectId: string; context: PluginContext; draftMode?: boolean }> = ({ projectId, context, draftMode = false }) => {
+  const [query, setQuery] = useState('Person(?p) ^ hasAge(?p, ?age) -> sqwrl:select(?p, ?age)');
+  const [results, setResults] = useState<SqwrlQueryResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [filterInput, setFilterInput] = useState('');
+  const [filterTerm, setFilterTerm] = useState('');
+  const [pageSize, setPageSize] = useState(SQWRL_DEFAULT_PAGE_SIZE);
+  const [page, setPage] = useState(0);
+  const [sort, setSort] = useState<SqwrlSort | null>(null);
+  const [copyNote, setCopyNote] = useState('');
+  const [serverPage, setServerPage] = useState<{ key: string; rows: Record<string, any>[]; filtered: number } | null>(null);
+  const [pageNote, setPageNote] = useState('');
+  const [expired, setExpired] = useState(false);
+  const fetchSeq = useRef(0);
+
+  useEffect(() => {
+    if (filterInput === filterTerm) return;
+    const timer = setTimeout(() => {
+      setFilterTerm(filterInput);
+      setPage(0);
+    }, SQWRL_FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [filterInput, filterTerm]);
+
+  const runId = results?.runId;
+
+  const execute = useCallback(async () => {
+    setLoading(true);
+    setResults(null);
+    setServerPage(null);
+    setPageNote('');
+    setExpired(false);
+    setFilterInput('');
+    setFilterTerm('');
+    setPage(0);
+    setSort(null);
+    setCopyNote('');
+    try {
+      const res = await apiClient.post<SqwrlQueryResponse>(
+        withDraft(`/api/swrl/${projectId}/sqwrl/query`, draftMode),
+        { queryText: query, pageSize }
+      );
+      if (res.runId) {
+        setServerPage({ key: pageKey(res.runId, '', null, 0, pageSize), rows: res.rows ?? [], filtered: res.filteredRows ?? (res.rows ?? []).length });
+      }
+      setResults(res);
+    } catch (e: any) {
+      console.error(e);
+      setResults({
+        columnNames: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        success: false,
+        errorMessage: e.message || 'Query execution failed'
+      });
+    } finally { setLoading(false); }
+  }, [projectId, query, draftMode, pageSize]);
+
+  const columns = results?.columnNames ?? [];
+  const meta = useMemo(() => sqwrlMeta(results ?? {}), [results]);
+  const storedRows = runId ? (results?.storedRows ?? meta.returned) : meta.returned;
+  const wantedKey = runId ? pageKey(runId, filterTerm, sort, page, pageSize) : '';
+
+  useEffect(() => {
+    if (!runId || !wantedKey || serverPage?.key === wantedKey) return;
+    const seq = ++fetchSeq.current;
+    apiClient
+      .get<{ rows: Record<string, any>[]; filteredRows: number }>(
+        sqwrlRowsPath(projectId, runId, { offset: page * pageSize, limit: pageSize, filter: filterTerm, sort }, draftMode)
+      )
+      .then((res) => {
+        if (seq !== fetchSeq.current) return;
+        setPageNote('');
+        setServerPage({ key: wantedKey, rows: res.rows ?? [], filtered: res.filteredRows ?? 0 });
+      })
+      .catch((e: any) => {
+        if (seq !== fetchSeq.current) return;
+        if (e?.status === 410) {
+          setExpired(true);
+        } else {
+          setPageNote(e?.data?.message || e?.message || 'Could not load this page. Try again.');
+        }
+      });
+  }, [runId, wantedKey, serverPage, projectId, page, pageSize, filterTerm, sort, draftMode]);
+
+  const local = useMemo(
+    () => (runId ? null : localPage(results?.rows ?? [], columns, filterTerm, sort, page, pageSize)),
+    [runId, results, filterTerm, sort, page, pageSize]
+  );
+  const filteredCount = runId ? (serverPage?.filtered ?? 0) : (local?.filtered ?? 0);
+  const safePage = clampPage(page, filteredCount, pageSize);
+  const pageRows = runId ? (serverPage?.rows ?? []) : (local?.rows ?? []);
+  const lastPage = pageCount(filteredCount, pageSize) - 1;
+  const notice = truncationNotice(meta);
+
+  const allFilteredRows = async (): Promise<Record<string, any>[]> => {
+    if (runId) {
+      const res = await apiClient.get<{ rows: Record<string, any>[] }>(
+        sqwrlRowsPath(projectId, runId, { offset: 0, limit: 1, filter: filterTerm, sort, exportAll: true }, draftMode)
+      );
+      return res.rows ?? [];
+    }
+    return sortRows(filterRows(results?.rows ?? [], columns, filterTerm), sort);
+  };
+
+  const downloadCsv = async () => {
+    try {
+      const blob = new Blob([buildCsv(await allFilteredRows(), columns)], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sqwrl-results.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: any) {
+      if (e?.status === 410) setExpired(true);
+      else setPageNote(e?.data?.message || e?.message || 'Could not prepare the download. Try again.');
+    }
+  };
+
+  const copyTsv = async () => {
+    try {
+      const rows = await allFilteredRows();
+      await navigator.clipboard.writeText(buildTsv(rows, columns));
+      setCopyNote(`Copied ${formatNumber(rows.length)} rows`);
+    } catch (e: any) {
+      if (e?.status === 410) setExpired(true);
+      else setCopyNote('Copy failed');
+    }
+    setTimeout(() => setCopyNote(''), 2500);
+  };
+
+  const queryExamples = [
+    { label: 'All Persons with Age', query: 'Person(?p) ^ hasAge(?p, ?age) -> sqwrl:select(?p, ?age)' },
+    { label: 'Adults (age > 18)', query: 'Person(?p) ^ hasAge(?p, ?age) ^ swrlb:greaterThan(?age, 18) -> sqwrl:select(?p, ?age) ^ sqwrl:orderBy(?age)' },
+    { label: 'Count Persons', query: 'Person(?p) -> sqwrl:count(?p)' },
+    { label: 'Average Age', query: 'Person(?p) ^ hasAge(?p, ?age) -> sqwrl:avg(?age)' },
+    { label: 'Min/Max Age', query: 'Person(?p) ^ hasAge(?p, ?age) -> sqwrl:min(?age) ^ sqwrl:max(?age)' },
+  ];
+
+  return (
+    <div className="flex flex-col h-full min-h-0 bg-gray-50">
+      <div className="p-4 border-b border-gray-300 flex justify-between items-center">
+        <h3 className="text-lg font-semibold text-gray-800">SQWRL Query</h3>
+        <select 
+          onChange={(e) => e.target.value && setQuery(e.target.value)}
+          className="text-sm border border-gray-300 rounded px-2 py-1 bg-white"
+          defaultValue=""
+        >
+          <option value="">📚 Examples...</option>
+          {queryExamples.map((ex, i) => (
+            <option key={i} value={ex.query}>{ex.label}</option>
+          ))}
+        </select>
+      </div>
+      <div className="p-4 flex-1 min-h-0 overflow-y-auto flex flex-col gap-4">
+        <textarea 
+          className="w-full h-32 p-3 font-mono text-sm border-2 border-gray-400 rounded-lg bg-white focus:ring-2 focus:ring-purple-500 focus:border-purple-500 text-black placeholder-gray-500 shrink-0 resize-y"
+          style={{ minHeight: '8rem', flexShrink: 0 }}
+          value={query} 
+          onChange={(e) => setQuery(e.target.value)} 
+          placeholder="Enter SQWRL query… e.g., Person(?p) ^ hasAge(?p, ?age) -> sqwrl:select(?p, ?age)" 
+        />
+        <button onClick={execute} disabled={loading} className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-purple-300 text-sm">
+          {loading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />} Execute Query
+        </button>
+        
+        <div className="flex-1 min-h-0 overflow-auto border-2 border-gray-300 rounded-lg bg-white" style={{ minHeight: '18rem' }}>
+          {!results ? (
+            <div className="h-full flex flex-col items-center justify-center text-gray-500 p-4">
+              <HelpCircle size={32} className="mb-2 opacity-50" />
+              <p>Query results will appear here.</p>
+              <p className="text-xs mt-2">Use sqwrl:select(?var) in the head to query data</p>
+            </div>
+          ) : !results.success ? (
+            <div className="p-4 bg-red-50 text-red-700">
+              {(() => {
+                const err = parseSwrlError(results.errorMessage || 'Query execution failed');
+                return (
+                  <>
+                    <div className="flex items-center gap-2 font-semibold mb-1">
+                      <AlertCircle size={18} />
+                      {err.title}
+                    </div>
+                    <div className="text-sm mb-1">{err.detail}</div>
+                    {err.hint && (
+                      <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mt-2">
+                        💡 {err.hint}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          ) : results.rows.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-gray-500 p-4">
+              <AlertCircle size={32} className="mb-2 opacity-50" />
+              <p>No results found</p>
+              <p className="text-xs mt-1">Execution time: {results.executionTimeMs}ms</p>
+            </div>
+          ) : (
+            <div>
+              <div className="p-2 bg-green-50 border-b border-green-200 text-green-700 text-sm flex items-center justify-between">
+                <span className="flex items-center gap-2" data-testid="sqwrl-results-line">
+                  <Check size={16} />
+                  {resultsLine(meta, results.executionTimeMs)}
+                </span>
+              </div>
+              {notice && (
+                <div className="p-2 text-sm" style={rt.bannerWarning} data-testid="sqwrl-truncation-notice">{notice}</div>
+              )}
+              <div className="p-2 flex flex-wrap items-center gap-2 text-sm" style={rt.panelHeader}>
+                <input
+                  type="search"
+                  value={filterInput}
+                  onChange={(e) => setFilterInput(e.target.value)}
+                  placeholder="Filter all columns"
+                  aria-label="Filter results"
+                  className="px-2 py-1 rounded text-sm"
+                  style={rt.input}
+                />
+                <button onClick={copyTsv} className="px-2 py-1 rounded text-xs" style={rt.button}>Copy (TSV)</button>
+                <button onClick={downloadCsv} className="px-2 py-1 rounded text-xs" style={rt.button}>Download CSV</button>
+                {copyNote && <span className="text-xs" style={rt.muted}>{copyNote}</span>}
+                {pageNote && <span className="text-xs" style={rt.bannerError}>{pageNote}</span>}
+                <label className="ml-auto flex items-center gap-1 text-xs" style={rt.label}>
+                  Rows per page
+                  <select
+                    value={pageSize}
+                    onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
+                    className="px-1 py-0.5 rounded text-xs"
+                    style={rt.input}
+                    aria-label="Rows per page"
+                  >
+                    {SQWRL_PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </label>
+              </div>
+              <table className="min-w-full text-sm">
+                <thead className="bg-gray-100 sticky top-0">
+                  <tr>
+                    <th className="p-2 text-left font-semibold text-gray-500 w-8">#</th>
+                    {columns.map(c => (
+                      <th
+                        key={c}
+                        className="p-2 text-left font-semibold text-gray-700 cursor-pointer select-none"
+                        onClick={() => { setSort(nextSort(sort, c)); setPage(0); }}
+                        aria-sort={sort?.column === c ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+                      >
+                        {c}{sort?.column === c ? ` ${sortArrow(sort, c)}` : ''}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {pageRows.map((row, i) => (
+                    <tr key={safePage * pageSize + i} className="hover:bg-gray-50">
+                      <td className="p-2 text-gray-400 text-xs">{safePage * pageSize + i + 1}</td>
+                      {columns.map(c => (
+                        <td key={c} className="p-2 text-gray-800 whitespace-nowrap font-mono">{String(row[c] ?? '')}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {expired && (
+                <div className="p-3 text-sm flex items-center gap-2" style={rt.bannerWarning} data-testid="sqwrl-expired">
+                  {SQWRL_EXPIRED_MESSAGE}
+                  <button onClick={execute} className="px-2 py-1 rounded text-xs" style={rt.button}>Run again</button>
+                </div>
+              )}
+              {!expired && filteredCount === 0 && (runId ? serverPage !== null : true) && (
+                <div className="p-4 text-sm text-center" style={rt.muted}>No rows match the filter.</div>
+              )}
+              <div className="p-2 flex flex-wrap items-center gap-2 text-xs sticky bottom-0" style={rt.panelHeader}>
+                <span data-testid="sqwrl-showing">{showingText(filteredCount, storedRows, safePage, pageSize)}</span>
+                <span className="ml-auto flex items-center gap-1">
+                  <button onClick={() => setPage(0)} disabled={safePage === 0} className="px-2 py-1 rounded" style={btn(safePage === 0)} aria-label="First page">First</button>
+                  <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} className="px-2 py-1 rounded" style={btn(safePage === 0)}>Previous</button>
+                  <button onClick={() => setPage(safePage + 1)} disabled={safePage >= lastPage} className="px-2 py-1 rounded" style={btn(safePage >= lastPage)}>Next</button>
+                  <button onClick={() => setPage(lastPage)} disabled={safePage >= lastPage} className="px-2 py-1 rounded" style={btn(safePage >= lastPage)} aria-label="Last page">Last</button>
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+interface ResultsPanelProps {
+  projectId: string;
+  draftMode?: boolean;
+  results: ExecutionResponse | null;
+  isExecuting: boolean;
+  onAdd?: (axioms: InferredAxiom[]) => Promise<{ ok: boolean; message: string }>;
+  onRerun?: () => void;
+  rules?: SwrlRule[];
+}
+
+
+
+type ParsedAxiom = { type: string; subject: string; predicate?: string; object?: string; formatted: string; recognized?: boolean };
+
+const parseAxiomText = (axiom: InferredAxiom, readable: string): ParsedAxiom => {
+
+  const clean = (s: string) => extractLocalName(s);
+  
+  const classAssertionMatch = readable.match(/ClassAssertion\s*\(\s*(?:<)?([^>\s)]+)(?:>)?\s+(?:<)?([^>\s)]+)(?:>)?\s*\)/i);
+  if (classAssertionMatch) {
+    const className = clean(classAssertionMatch[1]);
+    const individual = clean(classAssertionMatch[2]);
+    return {
+      type: 'ClassAssertion',
+      subject: individual,
+      object: className,
+      formatted: `${individual} → ${className}`
+    };
+  }
+  
+  const objPropMatch = readable.match(/ObjectPropertyAssertion\s*\(\s*(?:<)?([^>\s)]+)(?:>)?\s+(?:<)?([^>\s)]+)(?:>)?\s+(?:<)?([^>\s)]+)(?:>)?\s*\)/i);
+  if (objPropMatch) {
+    const prop = clean(objPropMatch[1]);
+    const subject = clean(objPropMatch[2]);
+    const object = clean(objPropMatch[3]);
+    return {
+      type: 'ObjectPropertyAssertion',
+      subject,
+      predicate: prop,
+      object,
+      formatted: `${subject} ${prop} ${object}`
+    };
+  }
+  
+  const dataPropMatch = readable.match(/DataPropertyAssertion\s*\(\s*(?:<)?([^>\s)]+)(?:>)?\s+(?:<)?([^>\s)]+)(?:>)?\s+(.+)\s*\)/i);
+  if (dataPropMatch) {
+    const prop = clean(dataPropMatch[1]);
+    const subject = clean(dataPropMatch[2]);
+    let value = dataPropMatch[3];
+    value = value.replace(/"\^\^.*$/, '').replace(/^"|"$/g, '');
+    return {
+      type: 'DataPropertyAssertion',
+      subject,
+      predicate: prop,
+      object: value,
+      formatted: `${subject} ${prop} = ${value}`
+    };
+  }
+
+  const subClassMatch = readable.match(/SubClassOf\s*\(\s*(?:<)?([^>\s)]+)(?:>)?\s+(?:<)?([^>\s)]+)(?:>)?\s*\)/i);
+  if (subClassMatch) {
+    const subClass = clean(subClassMatch[1]);
+    const superClass = clean(subClassMatch[2]);
+    return {
+      type: 'SubClassOf',
+      subject: subClass,
+      object: superClass,
+      formatted: `${subClass} ⊆ ${superClass}`
+    };
+  }
+
+  const equivClassMatch = readable.match(/EquivalentClasses\s*\(\s*<?([^>\s]+)>?/i);
+  if (equivClassMatch) {
+    const cls = clean(equivClassMatch[1]);
+    return {
+      type: 'EquivalentClasses',
+      subject: cls,
+      formatted: `Equivalent: ${cls}`
+    };
+  }
+
+  const sameIndMatch = readable.match(/SameIndividual\s*\(\s*<?([^>\s]+)>?/i);
+  if (sameIndMatch) {
+    const ind = clean(sameIndMatch[1]);
+    return {
+      type: 'SameIndividual',
+      subject: ind,
+      formatted: `Same: ${ind}`
+    };
+  }
+
+  const domainRangeMatch = readable.match(/(Data|Object)Property(Domain|Range)\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?\s*\)/i);
+  if (domainRangeMatch) {
+    const propType = domainRangeMatch[1];
+    const constraint = domainRangeMatch[2];
+    const prop = clean(domainRangeMatch[3]);
+    const cls = clean(domainRangeMatch[4]);
+    return {
+      type: `${propType}Property${constraint}`,
+      subject: prop,
+      object: cls,
+      formatted: `${prop} ${constraint.toLowerCase()}: ${cls}`
+    };
+  }
+
+  const equivObjPropsMatch = readable.match(/EquivalentObjectProperties\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?/i);
+  if (equivObjPropsMatch) {
+    const prop1 = clean(equivObjPropsMatch[1]);
+    const prop2 = clean(equivObjPropsMatch[2]);
+    return {
+      type: 'EquivalentObjectProperties',
+      subject: prop1,
+      object: prop2,
+      formatted: `${prop1} ≡ ${prop2}`
+    };
+  }
+
+  const equivDataPropsMatch = readable.match(/EquivalentDataProperties\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?/i);
+  if (equivDataPropsMatch) {
+    const prop1 = clean(equivDataPropsMatch[1]);
+    const prop2 = clean(equivDataPropsMatch[2]);
+    return {
+      type: 'EquivalentDataProperties',
+      subject: prop1,
+      object: prop2,
+      formatted: `${prop1} ≡ ${prop2}`
+    };
+  }
+
+  const subObjPropMatch = readable.match(/SubObjectPropertyOf\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?\s*\)/i);
+  if (subObjPropMatch) {
+    const subProp = clean(subObjPropMatch[1]);
+    const superProp = clean(subObjPropMatch[2]);
+    return {
+      type: 'SubObjectPropertyOf',
+      subject: subProp,
+      object: superProp,
+      formatted: `${subProp} ⊆ ${superProp}`
+    };
+  }
+
+  const subDataPropMatch = readable.match(/SubDataPropertyOf\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?\s*\)/i);
+  if (subDataPropMatch) {
+    const subProp = clean(subDataPropMatch[1]);
+    const superProp = clean(subDataPropMatch[2]);
+    return {
+      type: 'SubDataPropertyOf',
+      subject: subProp,
+      object: superProp,
+      formatted: `${subProp} ⊆ ${superProp}`
+    };
+  }
+
+  const declarationMatch = readable.match(/Declaration\s*\(\s*(Class|ObjectProperty|DataProperty|NamedIndividual|AnnotationProperty)\s*\(\s*<?([^>\s)]+)>?\s*\)\s*\)/i);
+  if (declarationMatch) {
+    const entityType = declarationMatch[1];
+    const entity = clean(declarationMatch[2]);
+    return {
+      type: 'Declaration',
+      subject: entity,
+      object: entityType,
+      formatted: `${entityType}: ${entity}`
+    };
+  }
+
+  const inversePropsMatch = readable.match(/InverseObjectProperties\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?\s*\)/i);
+  if (inversePropsMatch) {
+    const prop1 = clean(inversePropsMatch[1]);
+    const prop2 = clean(inversePropsMatch[2]);
+    return {
+      type: 'InverseObjectProperties',
+      subject: prop1,
+      object: prop2,
+      formatted: `${prop1} ↔ ${prop2}`
+    };
+  }
+
+  const funcObjPropMatch = readable.match(/FunctionalObjectProperty\s*\(\s*<?([^>\s]+)>?\s*\)/i);
+  if (funcObjPropMatch) {
+    const prop = clean(funcObjPropMatch[1]);
+    return {
+      type: 'FunctionalObjectProperty',
+      subject: prop,
+      formatted: `${prop} (functional)`
+    };
+  }
+
+  const transitiveMatch = readable.match(/TransitiveObjectProperty\s*\(\s*<?([^>\s]+)>?\s*\)/i);
+  if (transitiveMatch) {
+    const prop = clean(transitiveMatch[1]);
+    return {
+      type: 'TransitiveObjectProperty',
+      subject: prop,
+      formatted: `${prop} (transitive)`
+    };
+  }
+
+  const symmetricMatch = readable.match(/SymmetricObjectProperty\s*\(\s*<?([^>\s]+)>?\s*\)/i);
+  if (symmetricMatch) {
+    const prop = clean(symmetricMatch[1]);
+    return {
+      type: 'SymmetricObjectProperty',
+      subject: prop,
+      formatted: `${prop} (symmetric)`
+    };
+  }
+
+  const disjointMatch = readable.match(/DisjointClasses\s*\(\s*<?([^>\s]+)>?\s+<?([^>\s]+)>?/i);
+  if (disjointMatch) {
+    const cls1 = clean(disjointMatch[1]);
+    const cls2 = clean(disjointMatch[2]);
+    return {
+      type: 'DisjointClasses',
+      subject: cls1,
+      object: cls2,
+      formatted: `${cls1} ⊥ ${cls2}`
+    };
+  }
+  
+  const simplified = readable.replace(/<[^>]+#([^>]+)>/g, '$1').replace(/<[^>]+\/([^>/]+)>/g, '$1');
+  return {
+    type: axiom.axiomType || 'Unknown',
+    subject: simplified,
+    formatted: simplified || readable,
+    recognized: false
+  };
+};
+
+const formatInferredAxiom = (axiom: InferredAxiom): ParsedAxiom => {
+  const technical = parseAxiomText(axiom, axiom.description || '');
+  if (technical.recognized !== false) return technical;
+  const friendly = parseAxiomText(axiom, axiom.readable || '');
+  if (friendly.recognized !== false) return friendly;
+  return parseAxiomText(axiom, axiom.readable || axiom.description || '');
+};
+
+interface GroupedAxiomItem {
+  formatted: string;
+  subject: string;
+  object?: string;
+  rawReadable: string;
+  axiomType: string;
+  key: string;
+  selectable: boolean;
+  axiom: InferredAxiom;
+}
+
+const groupAxiomsByType = (axioms: InferredAxiom[]): Map<string, GroupedAxiomItem[]> => {
+  const groups = new Map<string, GroupedAxiomItem[]>();
+  
+  axioms.forEach(axiom => {
+    const parsed = formatInferredAxiom(axiom);
+    const type = parsed.type;
+    if (!groups.has(type)) {
+      groups.set(type, []);
+    }
+    groups.get(type)!.push({
+      formatted: parsed.formatted,
+      subject: parsed.subject || '(unknown)',
+      object: parsed.object,
+      rawReadable: axiom.readable || axiom.description || '',
+      axiomType: axiom.axiomType || type,
+      key: axiom.description,
+      selectable: axiom.category === 'conclusion',
+      axiom
+    });
+  });
+  
+  return groups;
+};
+
+const AXIOM_ICONS: Record<string, string> = {
+  ClassAssertion: '🏷️', ObjectPropertyAssertion: '🔗', DataPropertyAssertion: '📊', SubClassOf: '⊆', EquivalentClasses: '≡',
+  EquivalentObjectProperties: '⇔', SubObjectPropertyOf: '⊑', ObjectPropertyDomain: '🎯', ObjectPropertyRange: '🎪',
+  DataPropertyDomain: '📍', DataPropertyRange: '📐', SameIndividual: '👥', DifferentIndividuals: '👤',
+};
+
+const getAxiomTypeStyle = (type: string): { icon: string } => ({ icon: AXIOM_ICONS[type] || '📄' });
+
+const canExplain = (ax: InferredAxiom): boolean => ax.category === 'conclusion' && !!ax.subjectIri && !!ax.predicateIri;
+
+const canExplainIn = (ax: InferredAxiom, section: string): boolean => (section === 'rules' ? canExplain(ax) : toExplainFact(ax) !== null);
+
+type FactSection = 'rules' | 'standard' | 'structure';
+
+const SECTION_TITLES: Record<FactSection, string> = { rules: 'From your rules', standard: 'From standard reasoning', structure: 'Class relationships' };
+const SECTION_ORDER: FactSection[] = ['rules', 'standard', 'structure'];
+const STANDARD_NOTE = 'These follow from the class tree and the standard reasoning the engine always applies, not from a rule you wrote. For example, a Customer is also a Person because Customer is a kind of Person. They are not errors, and no rule explanation exists for them.';
+
+const atomLocalName = (raw: string): string => raw.replace(/^<|>$/g, '').split(/[#/:]/).pop() || '';
+
+const ruleHeadNames = (rules: SwrlRule[]): Set<string> => {
+  const names = new Set<string>();
+  rules.forEach(rule => {
+    const text = rule.ruleText || '';
+    if (!rule.enabled || /sqwrl:/i.test(text)) return;
+    const ascii = text.lastIndexOf('->');
+    const unicode = text.lastIndexOf('\u2192');
+    if (ascii < 0 && unicode < 0) return;
+    const head = ascii > unicode ? text.slice(ascii + 2) : text.slice(unicode + 1);
+    const pattern = /([^\s(),^]+)\s*\(/g;
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(head)) !== null) {
+      const name = atomLocalName(m[1]);
+      if (name) names.add(name);
+    }
+  });
+  return names;
+};
+
+const sectionOf = (ax: InferredAxiom, heads: Set<string>): FactSection => {
+  if (ax.category !== 'conclusion') return 'structure';
+  const parsed = formatInferredAxiom(ax);
+  const name = parsed.type === 'ClassAssertion' ? parsed.object : parsed.predicate;
+  return name && heads.has(name) ? 'rules' : 'standard';
+};
+
+interface SectionData {
+  key: FactSection;
+  title: string;
+  note?: string;
+  axioms: InferredAxiom[];
+  groups: Map<string, GroupedAxiomItem[]>;
+}
+
+const splitSections = (axioms: InferredAxiom[], heads: Set<string>): SectionData[] => {
+  const buckets: Record<FactSection, InferredAxiom[]> = { rules: [], standard: [], structure: [] };
+  axioms.forEach(ax => buckets[sectionOf(ax, heads)].push(ax));
+  return SECTION_ORDER.filter(key => buckets[key].length > 0).map(key => ({
+    key,
+    title: SECTION_TITLES[key],
+    note: key === 'rules' ? undefined : STANDARD_NOTE,
+    axioms: buckets[key],
+    groups: groupAxiomsByType(buckets[key]),
+  }));
+};
+
+const WHY_STYLE = '.swrl-why{opacity:.8}.swrl-why-host:hover .swrl-why,.swrl-why-host:focus-within .swrl-why,.swrl-why:hover,.swrl-why:focus-visible,.swrl-why[aria-expanded="true"]{opacity:1}';
+
+const WhyButton: React.FC<{ onClick: () => void; open?: boolean }> = ({ onClick, open }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className="swrl-why inline-flex items-center text-xs font-semibold underline"
+    style={rt.link}
+    aria-label="Why was this concluded?"
+    aria-expanded={!!open}
+    title="Why was this concluded?"
+  >
+    Why?
+  </button>
+);
+
+const AxiomCard: React.FC<{ item: GroupedAxiomItem; index: number; selected?: boolean; onToggle?: (key: string) => void; onWhy?: (axiom: InferredAxiom) => void; canWhy?: boolean; whyOpen?: boolean }> = ({ item, index, selected, onToggle, onWhy, canWhy, whyOpen }) => {
+  const [showTooltip, setShowTooltip] = useState(false);
+  const displaySubject = item.subject || item.formatted || `Item ${index + 1}`;
+  
+  return (
+    <div 
+      className="relative group swrl-why-host"
+      onMouseEnter={() => setShowTooltip(true)}
+      onMouseLeave={() => setShowTooltip(false)}
+    >
+      <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:shadow-sm transition-all cursor-default min-w-[80px]" style={rt.card}>
+        {onToggle && item.selectable && (
+          <input
+            type="checkbox"
+            checked={!!selected}
+            onChange={() => onToggle(item.key)}
+            aria-label="Select this conclusion"
+          />
+        )}
+        <span className="font-semibold truncate max-w-[200px]" style={rt.value} title={displaySubject}>
+          {displaySubject}
+        </span>
+        {item.object && (
+          <>
+            <span className="font-bold" style={rt.label}>→</span>
+            <span className="font-semibold truncate max-w-[200px]" style={rt.value} title={item.object}>
+              {item.object}
+            </span>
+          </>
+        )}
+        {onWhy && canWhy && (
+          <WhyButton onClick={() => onWhy(item.axiom)} open={whyOpen} />
+        )}
+      </div>
+      {showTooltip && item.rawReadable && (
+        <div className="absolute z-50 bottom-full left-0 mb-2 p-3 text-xs rounded-lg shadow-xl max-w-md whitespace-pre-wrap break-all" style={rt.tooltip}>
+          <div className="font-semibold mb-1">{item.axiomType}</div>
+          <div className="font-mono">{item.rawReadable}</div>
+          <div className="absolute bottom-0 left-4 transform translate-y-1/2 rotate-45 w-2 h-2" style={{ backgroundColor: 'var(--text-primary)' }}></div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ResultsPanel: React.FC<ResultsPanelProps> = ({ projectId, results, isExecuting, onAdd, onRerun, rules = [], draftMode = false }) => {
+  const ruleHeads = useMemo(() => ruleHeadNames(rules), [rules]);
+  const [explained, setExplained] = useState<InferredAxiom | null>(null);
+  const toggleWhy = (ax: InferredAxiom) => setExplained(prev => (prev === ax ? null : ax));
+  const [addState, setAddState] = useState<{ phase: 'idle' | 'confirm' | 'busy' | 'done' | 'error'; message?: string }>({ phase: 'idle' });
+  const [showInferredAxioms, setShowInferredAxioms] = useState(true);
+  const [viewMode, setViewMode] = useState<'grouped' | 'table' | 'raw'>('grouped');
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [searchFilter, setSearchFilter] = useState('');
+  const [showWarning, setShowWarning] = useState(false);
+  const [scopeChoice, setScopeChoice] = useState<'conclusions' | 'structure' | 'all' | null>(null);
+  const [visibleLimit, setVisibleLimit] = useState(100);
+  const [selectedMap, setSelectedMap] = useState<Map<string, InferredAxiom>>(new Map());
+  const selectedKeys = useMemo(() => new Set(selectedMap.keys()), [selectedMap]);
+
+  const paged = isPagedRun(results);
+  const runId = results?.runId ?? '';
+  const [tabChoice, setTabChoice] = useState<AxiomKind | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [pageCache, setPageCache] = useState<Record<string, AxiomsPageResponse>>({});
+  const [pageLoading, setPageLoading] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [expired, setExpired] = useState(false);
+  const lastShownRef = useRef<AxiomsPageResponse | null>(null);
+  const pagedKind: AxiomKind = tabChoice ?? ((results?.counts?.conclusions ?? 0) > 0 || (results?.counts?.structure ?? 0) === 0 ? 'conclusions' : 'structure');
+  const pageKey = pageCacheKey(runId, pagedKind, debouncedQuery.trim(), offset);
+  const pageCached = pageCache[pageKey] !== undefined;
+
+  useEffect(() => {
+    setTabChoice(null);
+    setOffset(0);
+    setPageCache({});
+    setPageError(null);
+    setExpired(false);
+    setSelectedMap(new Map());
+    lastShownRef.current = null;
+  }, [runId]);
+
+  useEffect(() => {
+    if (!paged) return;
+    const t = setTimeout(() => {
+      setDebouncedQuery(prev => {
+        if (prev.trim() === searchFilter.trim()) return prev;
+        setOffset(0);
+        return searchFilter;
+      });
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchFilter, paged]);
+
+  useEffect(() => {
+    if (!paged || expired) return;
+    if (pageCached) {
+      setPageError(null);
+      return;
+    }
+    let cancelled = false;
+    setPageLoading(true);
+    setPageError(null);
+    apiClient
+      .get<AxiomsPageResponse>(axiomsPagePath(projectId, runId, { offset, limit: RESULTS_PAGE_SIZE, kind: pagedKind, query: debouncedQuery }, draftMode))
+      .then(res => {
+        if (cancelled) return;
+        const page: AxiomsPageResponse = { ...res, axioms: Array.isArray(res?.axioms) ? res.axioms : [], total: typeof res?.total === 'number' ? res.total : 0 };
+        setPageCache(prev => ({ ...prev, [pageKey]: page }));
+      })
+      .catch(e => {
+        if (cancelled) return;
+        if (isExpiredRunError(e)) setExpired(true);
+        else setPageError(pageErrorMessage(e));
+      })
+      .finally(() => {
+        if (!cancelled) setPageLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [paged, expired, pageKey, pageCached]);
+
+  const currentPage = pageCache[pageKey] ?? lastShownRef.current;
+  if (pageCache[pageKey]) lastShownRef.current = pageCache[pageKey];
+  const pageAxioms: InferredAxiom[] = currentPage?.axioms ?? [];
+  const pageTotal = currentPage?.total ?? 0;
+
+  const toggleSelected = (key: string) => {
+    const ax = pageAxioms.find(a => a.description === key) ?? results?.inferredAxioms.find(a => a.description === key);
+    if (!ax) return;
+    setSelectedMap(prev => toggleSelection(prev, ax));
+  };
+
+  useEffect(() => {
+    setCollapsedGroups(new Set());
+  }, [results]);
+
+  const toggleGroup = (type: string) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        next.delete(type);
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
+  };
+
+  if (!results && isExecuting) return (
+    <div className="p-8 text-center flex flex-col items-center gap-3" style={rt.label}>
+      <Loader2 size={32} className="animate-spin" />
+      <p className="text-lg">Running rules…</p>
+    </div>
+  );
+
+  if (!results) return (
+    <div className="p-8 text-center" style={rt.label}>
+      <AlertCircle size={48} className="mx-auto mb-4 opacity-50" />
+      <p className="text-sm mb-3" data-testid="inferred-note">{INFERRED_NOTE}</p>
+      <p className="text-lg">Run rule execution to see results.</p>
+      <p className="text-sm mt-2">Click "Execute All Rules" to run SWRL inference</p>
+    </div>
+  );
+
+  const conclusionTotal = results.inferredAxioms.filter(ax => ax.category === 'conclusion').length;
+  const structureTotal = results.inferredAxioms.filter(ax => ax.category === 'structure').length;
+  const scope = scopeChoice ?? (conclusionTotal > 0 ? 'conclusions' : 'all');
+  const inScope = paged ? pageAxioms : results.inferredAxioms.filter(ax => {
+    if (!ax.category || scope === 'all') return true;
+    return scope === 'conclusions' ? ax.category === 'conclusion' : ax.category === 'structure';
+  });
+  const matchedAxioms = paged ? pageAxioms : searchFilter.trim()
+    ? inScope.filter(ax => {
+        const searchLower = searchFilter.toLowerCase();
+        const readable = (ax.readable || ax.description || '').toLowerCase();
+        const parsed = formatInferredAxiom(ax);
+        return readable.includes(searchLower) ||
+               parsed.subject?.toLowerCase().includes(searchLower) ||
+               parsed.object?.toLowerCase().includes(searchLower) ||
+               parsed.type?.toLowerCase().includes(searchLower);
+      })
+    : inScope;
+  const filteredAxioms = paged ? matchedAxioms : matchedAxioms.slice(0, visibleLimit);
+  const matchedConclusions = matchedAxioms.filter(ax => ax.category === 'conclusion');
+  const selectedConclusions = Array.from(selectedMap.values());
+  const selectedCount = selectedConclusions.length;
+  const allShownSelected = allSelected(selectedMap, matchedConclusions);
+  const selectAllShown = () => setSelectedMap(prev => addToSelection(prev, matchedConclusions));
+  const clearSelection = () => setSelectedMap(new Map());
+  const showList = showInferredAxioms && !expired;
+  const pagerPrev = previousOffset(offset);
+  const pagerNext = nextOffset(offset, pageTotal);
+
+  const modelTotals = {
+    conclusions: paged ? (results.counts?.conclusions ?? 0) : (results.conclusionCount ?? conclusionTotal),
+    structure: paged ? (results.counts?.structure ?? 0) : (results.structureCount ?? structureTotal),
+  };
+  const modelFilter: ResultFilter = paged ? pagedKind : scope;
+  const counts = resultCounts({
+    filter: modelFilter,
+    paged,
+    totals: modelTotals,
+    loaded: { conclusions: conclusionTotal, structure: structureTotal },
+    matched: paged ? pageTotal : matchedAxioms.length,
+    shown: filteredAxioms.length,
+    searching: searchFilter.trim() !== '',
+  });
+  const matchedSections = splitSections(matchedAxioms, ruleHeads);
+  const sections = splitSections(filteredAxioms, ruleHeads);
+  const loadedTotals = { conclusions: conclusionTotal, structure: structureTotal };
+  const sectionLabel = (sec: SectionData): string => {
+    if (paged) {
+      return counts.searching || sec.key !== 'structure' ? countLabel(sec.title, null, sec.axioms.length) : countLabel(sec.title, modelTotals.structure, sec.axioms.length);
+    }
+    const inSection = matchedSections.find(m => m.key === sec.key)?.axioms.length ?? 0;
+    return countLabel(sec.title, sectionTotal(sec.key, counts, modelTotals, loadedTotals, inSection), sec.axioms.length, counts.searching);
+  };
+  const groupText = (sec: SectionData, type: string, shown: number): string => {
+    const fullyLoaded = !paged && (sec.key === 'structure' ? structureTotal >= modelTotals.structure : conclusionTotal >= modelTotals.conclusions);
+    const inGroup = matchedSections.find(m => m.key === sec.key)?.groups.get(type)?.length ?? 0;
+    return groupLabel(groupTotal(!paged && (counts.searching || fullyLoaded), inGroup), shown, counts.searching && !paged);
+  };
+  const groupCount = sections.reduce((n, sec) => n + sec.groups.size, 0);
+  const orderedRows = sections.flatMap(sec => sec.axioms.map((ax, i) => ({ ax, sec, first: i === 0 })));
+  const expandAll = () => setCollapsedGroups(new Set());
+  const collapseAll = () => setCollapsedGroups(new Set(sections.flatMap(sec => Array.from(sec.groups.keys()).map(t => `${sec.key}|${t}`))));
+  
+  const summaryLine = derivedSummary({
+    conclusions: paged ? (results.counts?.conclusions ?? 0) : (results.conclusionCount ?? conclusionTotal),
+    structure: paged ? (results.counts?.structure ?? 0) : (results.structureCount ?? structureTotal),
+    omittedTrivial: results.omittedTrivialCount ?? results.counts?.omittedTrivial ?? 0,
+  });
+
+  return (
+    <div className="h-full overflow-y-auto">
+    <div className="p-4 space-y-4">
+      <style>{WHY_STYLE}</style>
+      <p className="text-sm" style={rt.label} data-testid="inferred-note">{INFERRED_NOTE}</p>
+      <div className="rounded-xl p-5 shadow-sm" style={rt.panel}>
+        <h3 className="font-bold mb-4 text-lg flex items-center gap-2" style={rt.heading}>
+          <BarChart2 size={20} />
+          Execution Summary
+          {results.executionMode && (
+            <span className="text-xs px-2 py-0.5 rounded-full" style={rt.chip}>
+              {results.executionMode === 'test' ? 'This rule only' : results.executionMode === 'selected' ? 'Selected Rules' : 'All Rules'}
+            </span>
+          )}
+        </h3>
+        <div className="grid grid-cols-4 gap-4">
+          <div className="rounded-lg p-3 shadow-sm" style={rt.card}>
+            <div className="text-xs uppercase tracking-wide mb-1" style={rt.label}>Status</div>
+            <div className="text-lg font-bold flex items-center gap-2" style={rt.value}>
+              {results.success ? <Check size={20} /> : <X size={20} />}
+              {results.success ? 'Success' : 'Failed'}
+            </div>
+          </div>
+          <div className="rounded-lg p-3 shadow-sm" style={rt.card}>
+            <div className="text-xs uppercase tracking-wide mb-1" style={rt.label}>Time</div>
+            <div className="text-lg font-bold" style={rt.value}>{results.executionTimeMs}ms</div>
+          </div>
+          <div className="rounded-lg p-3 shadow-sm" style={rt.card}>
+            <div className="text-xs uppercase tracking-wide mb-1" style={rt.label}>Rules Run</div>
+            <div className="text-lg font-bold" style={rt.value}>{results.totalRulesExecuted ?? results.executedRuleNames?.length ?? 0}</div>
+          </div>
+          <div className="rounded-lg p-3 shadow-sm" style={rt.card}>
+            <div className="text-xs uppercase tracking-wide mb-1" style={rt.label}>{results.executionMode === 'test' ? 'New conclusions' : 'Inferred'}</div>
+            <div className="text-lg font-bold" style={rt.value}>{results.inferredAxiomsCount}</div>
+          </div>
+        </div>
+        {summaryLine && <p className="mt-3 text-sm" style={rt.value} data-testid="results-summary">{summaryLine}</p>}
+
+        {results.executedRuleNames && results.executedRuleNames.length > 0 && (
+          <div className="mt-4 pt-4" style={rt.divider}>
+            <div className="text-xs uppercase tracking-wide mb-2" style={rt.label}>Executed Rules</div>
+            <div className="flex flex-wrap gap-2">
+              {results.executedRuleNames.map((name, idx) => (
+                <span key={idx} className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-full" style={rt.chip}>
+                  <Check size={12} style={{ color: 'var(--success)' }} />
+                  {name}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {results.status && results.status !== 'COMPLETED' && (
+        <div className="rounded-lg p-3 text-sm" style={rt.bannerWarning}>
+          <div className="font-semibold">{results.statusLabel || results.status}</div>
+          {results.message && <div className="mt-1">{results.message}</div>}
+          {results.consistencyStatement && <div className="mt-1">{results.consistencyStatement}</div>}
+        </div>
+      )}
+      {results.limitations && results.limitations.length > 0 && (
+        <div className="rounded-lg p-3 text-sm" style={rt.bannerNote}>
+          {results.limitations.map((text, i) => <div key={i}>{text}</div>)}
+        </div>
+      )}
+      {results.success && results.inferredAxioms.length > 0 && !results.inferredAxioms.some(ax => formatInferredAxiom(ax).type === 'ClassAssertion') && (
+        <div className="rounded-xl overflow-hidden" style={rt.bannerWarning}>
+          <div 
+            className="p-4 flex items-start gap-3 cursor-pointer"
+            onClick={() => setShowWarning(!showWarning)}
+          >
+            <AlertCircle size={24} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--warning)' }} />
+            <div className="flex-1">
+              <div className="flex justify-between items-center">
+                <div className="font-bold" style={rt.heading}>No SWRL ClassAssertion Results</div>
+                {showWarning ? <ChevronUp size={20} style={rt.value} /> : <ChevronDown size={20} style={rt.value} />}
+              </div>
+              {!showWarning && (
+                 <div className="text-sm mt-1" style={rt.value}>
+                   {results.inferredAxioms.length} general OWL inferences found. Click to see details.
+                 </div>
+              )}
+            </div>
+          </div>
+          
+          {showWarning && (
+            <div className="px-4 pb-4 pl-12">
+              <div className="text-sm mt-1" style={rt.value}>
+                Your SWRL rule should create ClassAssertion axioms (e.g., "Emma → Adult"). 
+                The {results.inferredAxioms.length} inferences below are general OWL reasoning results, not from SWRL rules.
+                <br /><br />
+                <strong>Most Common Issue:</strong>
+                <div className="mt-2 p-3 rounded-lg" style={rt.card}>
+                  <span className="font-bold">The target class doesn't exist!</span>
+                  <p className="mt-1">
+                    If your rule is <code className="px-1 rounded" style={rt.code}>Person(?p) → Adult(?p)</code>, 
+                    you need to <strong>first create the "Adult" class</strong> in your ontology's Classes tab.
+                  </p>
+                </div>
+                <br />
+                <strong>Other possible reasons:</strong>
+                <ul className="list-disc list-inside mt-1 space-y-1">
+                  <li>No individuals match the rule conditions (e.g., no persons with age ≥ 18)</li>
+                  <li>Missing data properties (hasAge) on Person individuals</li>
+                  <li>The rule has syntax errors in the body</li>
+                </ul>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!results.success && results.errorMessage && (() => {
+        const err = parseSwrlError(results.errorMessage);
+        return (
+          <div className="rounded-xl p-4" style={rt.bannerError}>
+            <div className="flex items-start gap-3">
+              <AlertCircle size={24} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--error)' }} />
+              <div className="flex-1 min-w-0">
+                <div className="font-bold text-lg" style={rt.heading}>{err.title}</div>
+                <div className="text-sm mt-1" style={rt.value}>{err.detail}</div>
+                {err.hint && (
+                  <div className="text-sm mt-2 rounded p-2" style={rt.bannerWarning}>
+                    💡 {err.hint}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {results.success && results.inferredAxioms.length > 0 && (
+        <div className="rounded-xl overflow-hidden shadow-sm" style={rt.panel}>
+          <div className="p-4 flex flex-col gap-3" style={rt.panelHeader}>
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-lg flex items-center gap-2" style={rt.heading}>
+                <span>📚</span>
+                <span data-testid="inferred-heading">{resultHeading(counts)}</span>
+              </h3>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1 rounded-lg p-1" style={{ backgroundColor: 'var(--surface-3)' }}>
+                  <button
+                    onClick={() => setViewMode('grouped')}
+                    className="px-3 py-1.5 text-xs font-medium rounded transition-all"
+                    style={viewMode === 'grouped' ? { ...rt.button, fontWeight: 700 } : { color: 'var(--text-secondary)' }}
+                    title="Grouped by axiom type"
+                  >
+                    📊 Grouped
+                  </button>
+                  <button
+                    onClick={() => setViewMode('table')}
+                    className="px-3 py-1.5 text-xs font-medium rounded transition-all"
+                    style={viewMode === 'table' ? { ...rt.button, fontWeight: 700 } : { color: 'var(--text-secondary)' }}
+                    title="Table view"
+                  >
+                    📋 Table
+                  </button>
+                  <button
+                    onClick={() => setViewMode('raw')}
+                    className="px-3 py-1.5 text-xs font-medium rounded transition-all"
+                    style={viewMode === 'raw' ? { ...rt.button, fontWeight: 700 } : { color: 'var(--text-secondary)' }}
+                    title="Raw axiom format"
+                  >
+                    📝 Raw
+                  </button>
+                </div>
+                {viewMode === 'grouped' && (
+                  <div className="flex gap-1">
+                    <button onClick={expandAll} disabled={groupCount === 0} className="px-2 py-1 text-xs rounded disabled:opacity-50" style={rt.button} title="Expand all" aria-label="Expand all">
+                      <Maximize2 size={14} />
+                    </button>
+                    <button onClick={collapseAll} disabled={groupCount === 0} className="px-2 py-1 text-xs rounded disabled:opacity-50" style={rt.button} title="Collapse all" aria-label="Collapse all">
+                      <Minimize2 size={14} />
+                    </button>
+                  </div>
+                )}
+                <button
+                  onClick={() => setShowInferredAxioms(!showInferredAxioms)}
+                className="flex items-center gap-1 px-3 py-1.5 text-sm rounded-lg transition-colors" style={rt.button}
+              >
+                {showInferredAxioms ? <EyeOff size={16} /> : <Eye size={16} />}
+                {showInferredAxioms ? 'Hide' : 'Show'}
+              </button>
+            </div>
+          </div>
+          {showInferredAxioms && (
+            <div className="px-4 pb-3">
+              <div className="relative">
+                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={rt.label} />
+                <input
+                  type="text"
+                  placeholder="Search axioms... (e.g., Adult, Person, hasAge)"
+                  value={searchFilter}
+                  onChange={(e) => setSearchFilter(e.target.value)}
+                  className="w-full pl-10 pr-8 py-2 text-sm rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-300" style={rt.input}
+                />
+                {searchFilter && (
+                  <button
+                    onClick={() => setSearchFilter('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2" style={rt.label}
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+              {searchFilter && (
+                <div className="mt-2 text-xs" style={rt.label}>
+                  {searchMatchText(counts, searchFilter.trim())}
+                </div>
+              )}
+              {onAdd && (matchedConclusions.length > 0 || (paged && selectedCount > 0)) && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  {addState.phase === 'idle' || addState.phase === 'done' || addState.phase === 'error' ? (
+                    <>
+                      <button
+                        onClick={selectAllShown}
+                        disabled={allShownSelected}
+                        className="px-3 py-1.5 rounded-lg" style={btn(allShownSelected)}
+                      >
+                        {paged ? 'Select all on this page' : 'Select all shown'} ({matchedConclusions.length})
+                      </button>
+                      <button
+                        onClick={clearSelection}
+                        disabled={selectedCount === 0}
+                        className="px-3 py-1.5 rounded-lg" style={btn(selectedCount === 0)}
+                      >
+                        {paged ? 'Clear selection' : 'Clear'}
+                      </button>
+                      <span style={rt.value}>{selectedCount} selected</span>
+                      <button
+                        onClick={() => setAddState({ phase: 'confirm' })}
+                        disabled={selectedCount === 0}
+                        className="px-3 py-1.5 rounded-lg font-medium" style={btn(selectedCount === 0, true)}
+                      >
+                        Add {selectedCount} selected
+                      </button>
+                    </>
+                  ) : addState.phase === 'confirm' ? (
+                    <>
+                      <span style={rt.value}>
+                        This writes {selectedCount} fact{selectedCount === 1 ? '' : 's'} into the ontology as one change you can undo. Facts that are already there are skipped.
+                      </span>
+                      <button
+                        onClick={async () => {
+                          setAddState({ phase: 'busy' });
+                          const outcome = await onAdd(selectedConclusions);
+                          if (outcome.ok) setSelectedMap(new Map());
+                          setAddState({ phase: outcome.ok ? 'done' : 'error', message: outcome.message });
+                        }}
+                        className="px-3 py-1.5 rounded-lg font-medium" style={rt.buttonPrimary}
+                      >
+                        Yes, add them
+                      </button>
+                      <button onClick={() => setAddState({ phase: 'idle' })} className="px-3 py-1.5 rounded-lg" style={rt.button}>Cancel</button>
+                    </>
+                  ) : (
+                    <span style={rt.value}>Adding…</span>
+                  )}
+                  {addState.message && (
+                    <span style={rt.value}>{addState.phase === 'error' ? '✗ ' : '✓ '}{addState.message}</span>
+                  )}
+                </div>
+              )}
+              {paged && results.counts && (
+                <div className="mt-3 space-y-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {([['conclusions', `Facts about individuals (${formatCount(results.counts.conclusions)})`], ['structure', `Class relationships (${formatCount(results.counts.structure)})`]] as const).map(([key, label]) => (
+                      <button
+                        key={key}
+                        onClick={() => { setTabChoice(key); setOffset(0); }}
+                        className="px-3 py-1 rounded-full" style={pagedKind === key ? rt.chipOn : rt.button}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {!paged && conclusionTotal + structureTotal > 0 && results.conclusionCount !== undefined && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  {([['conclusions', `Facts about individuals (${formatCount(results.conclusionCount)})`], ['structure', `Class relationships (${formatCount(results.structureCount ?? structureTotal)})`], ['all', 'Everything']] as const).map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => { setScopeChoice(key); setVisibleLimit(100); }}
+                      className="px-3 py-1 rounded-full" style={scope === key ? rt.chipOn : rt.button}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  {results.omittedTrivialCount ? <span style={rt.label}>{formatCount(results.omittedTrivialCount)} trivial same-individual facts hidden</span> : null}
+                  {cutoffNote(counts) ? <span style={rt.value} data-testid="cutoff-note">{cutoffNote(counts)}</span> : null}
+                </div>
+              )}
+            </div>
+          )}
+          </div>
+
+          {showList && viewMode === 'grouped' && (
+            <div className="max-h-[70vh] overflow-y-auto">
+              {sections.map(sec => {
+                const secOpen = !collapsedGroups.has(`sec:${sec.key}`);
+                return (
+                <div key={sec.key} data-testid={`section-${sec.key}`}>
+                  <button
+                    onClick={() => toggleGroup(`sec:${sec.key}`)}
+                    aria-expanded={secOpen}
+                    className="w-full px-4 py-2 flex items-center justify-between text-left" style={{ ...rt.panelHeader, color: 'var(--text-primary)' }}
+                  >
+                    <span className="text-sm font-bold">{sectionLabel(sec)}</span>
+                    <ChevronRight size={16} className={`transition-transform ${secOpen ? 'rotate-90' : ''}`} style={rt.label} />
+                  </button>
+                  {secOpen && sec.note && <div className="px-4 py-2 text-xs" style={rt.label}>{sec.note}</div>}
+                  {secOpen && Array.from(sec.groups.entries()).map(([type, items]) => {
+                const style = getAxiomTypeStyle(type);
+                const groupKey = `${sec.key}|${type}`;
+                const isExpanded = !collapsedGroups.has(groupKey);
+                return (
+                  <div key={groupKey} style={rt.rowBorder}>
+                    <button
+                      onClick={() => toggleGroup(groupKey)}
+                      aria-expanded={isExpanded}
+                      data-testid="group-header"
+                      className="w-full p-4 flex items-center justify-between transition-colors" style={{ backgroundColor: 'var(--surface-1)', color: 'var(--text-primary)' }}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="text-xl">{style.icon}</span>
+                        <span className="text-sm font-bold px-3 py-1 rounded-full" style={rt.chip}>
+                          {type}
+                        </span>
+                        <span className="text-sm font-medium" style={rt.label}>
+                          {groupText(sec, type, items.length)}
+                        </span>
+                      </div>
+                      <ChevronRight size={20} className={`transition-transform ${isExpanded ? 'rotate-90' : ''}`} style={rt.label} />
+                    </button>
+                    {isExpanded && (
+                      <div className="p-4 pt-2" style={{ backgroundColor: 'var(--surface-1)' }}>
+                        <div className="flex flex-wrap gap-2">
+                          {items.map((item, i) => (
+                            <AxiomCard key={i} item={item} index={i} selected={selectedKeys.has(item.key)} onToggle={onAdd ? toggleSelected : undefined} onWhy={toggleWhy} canWhy={canExplainIn(item.axiom, sec.key)} whyOpen={explained === item.axiom} />
+                          ))}
+                        </div>
+                        {explained && items.some(it => it.axiom === explained) && (
+                          <div className="mt-2">
+                            <ExplainPanel projectId={projectId} draftMode={draftMode} ruleless={sec.key !== 'rules'} axiom={explained} onClose={() => setExplained(null)} />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+                </div>
+                );
+              })}
+            </div>
+          )}
+
+          {showList && viewMode === 'table' && (
+            <div className="max-h-[70vh] overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0" style={rt.panelHeader}>
+                  <tr>
+                    {onAdd && <th className="px-4 py-3 text-left font-semibold w-8" style={rt.heading}></th>}
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}>#</th>
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}>Type</th>
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}>Subject</th>
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}>Relation</th>
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}>Object</th>
+                    <th className="px-4 py-3 text-left font-semibold" style={rt.heading}></th>
+                  </tr>
+                </thead>
+                <tbody style={{ color: 'var(--text-primary)' }}>
+                  {orderedRows.map(({ ax, sec, first }, i) => {
+                    const parsed = formatInferredAxiom(ax);
+                    const style = getAxiomTypeStyle(parsed.type);
+                    return (
+                      <React.Fragment key={i}>
+                      {first && (
+                        <tr style={rt.panelHeader}>
+                          <td colSpan={onAdd ? 7 : 6} className="px-4 py-2 text-xs">
+                            <div className="font-bold text-sm" style={rt.heading}>{sectionLabel(sec)}</div>
+                            {sec.note && <div style={rt.label}>{sec.note}</div>}
+                          </td>
+                        </tr>
+                      )}
+                      <tr className="swrl-why-host" style={rt.rowBorder} title={ax.readable}>
+                        {onAdd && (
+                          <td className="px-4 py-2">
+                            {ax.category === 'conclusion' && (
+                              <input
+                                type="checkbox"
+                                checked={selectedKeys.has(ax.description)}
+                                onChange={() => toggleSelected(ax.description)}
+                                aria-label="Select this conclusion"
+                              />
+                            )}
+                          </td>
+                        )}
+                        <td className="px-4 py-2 font-mono text-xs" style={rt.label}>{i + 1}</td>
+                        <td className="px-4 py-2">
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded" style={rt.chip}>
+                            {style.icon} {parsed.type}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 font-medium max-w-[200px] truncate" style={rt.value}>{parsed.subject || '-'}</td>
+                        <td className="px-4 py-2 font-bold text-center" style={rt.label}>{parsed.predicate || '→'}</td>
+                        <td className="px-4 py-2 font-medium max-w-[200px] truncate" style={rt.value}>{parsed.object || '-'}</td>
+                        <td className="px-4 py-2">
+                          {canExplainIn(ax, sec.key) && (
+                            <WhyButton onClick={() => toggleWhy(ax)} open={explained === ax} />
+                          )}
+                        </td>
+                      </tr>
+                      {explained === ax && (
+                        <tr>
+                          <td colSpan={onAdd ? 7 : 6} className="px-4 py-2">
+                            <ExplainPanel projectId={projectId} draftMode={draftMode} ruleless={sec.key !== 'rules'} axiom={ax} onClose={() => setExplained(null)} />
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {expired && (
+            <div className="p-4 flex flex-wrap items-center gap-3 text-sm" style={rt.bannerWarning}>
+              <span>{EXPIRED_RUN_MESSAGE}</span>
+              {onRerun && (
+                <button onClick={onRerun} className="px-3 py-1.5 rounded-lg font-medium" style={rt.buttonPrimary}>Run again</button>
+              )}
+            </div>
+          )}
+
+          {showList && paged && (
+            <div className="p-3 flex flex-wrap items-center justify-center gap-3 text-xs" style={rt.divider}>
+              <button onClick={() => pagerPrev !== null && setOffset(pagerPrev)} disabled={pagerPrev === null} className="px-3 py-1.5 rounded-lg" style={btn(pagerPrev === null)}>Previous</button>
+              <span style={rt.value}>{pageRangeText(offset, pageAxioms.length, pageTotal)}</span>
+              <button onClick={() => pagerNext !== null && setOffset(pagerNext)} disabled={pagerNext === null} className="px-3 py-1.5 rounded-lg" style={btn(pagerNext === null)}>Next</button>
+              {pageLoading && <span style={rt.label}>Loading...</span>}
+              {pageError && <span style={rt.value}>{pageError}</span>}
+            </div>
+          )}
+
+          {showInferredAxioms && !paged && showMoreLabel(counts, 100) && (
+            <div className="p-3 text-center" style={rt.divider}>
+              <button onClick={() => setVisibleLimit(visibleLimit + 100)} className="px-4 py-1.5 text-sm rounded-lg" style={rt.button}>
+                {showMoreLabel(counts, 100)}
+              </button>
+            </div>
+          )}
+
+          {showList && viewMode === 'raw' && (
+            <div className="max-h-[70vh] overflow-y-auto">
+              {orderedRows.map(({ ax, sec, first }, i) => {
+                const style = getAxiomTypeStyle(ax.axiomType);
+                return (
+                  <React.Fragment key={i}>
+                  {first && (
+                    <div className="px-4 py-2 text-xs" style={rt.panelHeader}>
+                      <div className="font-bold text-sm" style={rt.heading}>{sectionLabel(sec)}</div>
+                      {sec.note && <div style={rt.label}>{sec.note}</div>}
+                    </div>
+                  )}
+                  <div className="p-4 swrl-why-host" style={{ ...rt.rowBorder, backgroundColor: i % 2 === 0 ? 'var(--surface-1)' : 'var(--surface-2)', color: 'var(--text-primary)' }}>
+                    <div className="flex items-center gap-2 mb-2">
+                      {onAdd && ax.category === 'conclusion' && (
+                        <input
+                          type="checkbox"
+                          checked={selectedKeys.has(ax.description)}
+                          onChange={() => toggleSelected(ax.description)}
+                          aria-label="Select this conclusion"
+                        />
+                      )}
+                      <span className="font-mono text-xs" style={rt.label}>#{i + 1}</span>
+                      <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded" style={rt.chip}>
+                        {style.icon} {ax.axiomType}
+                      </span>
+                      {canExplainIn(ax, sec.key) && (
+                        <WhyButton onClick={() => toggleWhy(ax)} open={explained === ax} />
+                      )}
+                    </div>
+                    <pre className="text-sm font-mono p-3 rounded-lg overflow-x-auto whitespace-pre-wrap break-all" style={rt.code}>{ax.readable}</pre>
+                    {explained === ax && (
+                      <div className="mt-2">
+                        <ExplainPanel projectId={projectId} draftMode={draftMode} ruleless={sec.key !== 'rules'} axiom={ax} onClose={() => setExplained(null)} />
+                      </div>
+                    )}
+                  </div>
+                  </React.Fragment>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {results.success && results.inferredAxiomsCount === 0 && (
+        <div className="rounded-xl p-6 text-center" style={rt.bannerWarning}>
+          <div className="text-4xl mb-3">🔍</div>
+          <p className="font-semibold text-lg" style={rt.heading}>No New Axioms Inferred</p>
+          <p className="text-sm mt-2" style={rt.value}>
+            The rules executed successfully, but no new knowledge was derived.
+            This may happen if the conditions aren't met or axioms already exist.
+          </p>
+        </div>
+      )}
+    </div>
+    </div>
+  );
+};
+
+
+interface SWRLEditorProps {
+  projectId: string;
+  context?: PluginContext;
+  draftMode?: boolean;
+}
+
+export const SWRLEditor: React.FC<SWRLEditorProps> = ({ projectId, context, draftMode = false }) => {
+
+  const rulesVersionRef = useRef(0);
+  const [rules, setRules] = useState<SwrlRule[]>([]);
+  const [selectedRule, setSelectedRule] = useState<SwrlRule | null>(null);
+  const [selectedRuleIds, setSelectedRuleIds] = useState<Set<string>>(new Set());
+  const [isLoading, setIsLoading] = useState(true);
+  const [isEditing, setIsEditing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isExecuting, setIsExecuting] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+  const saveInFlightRef = useRef(false);
+  const runInFlightRef = useRef(false);
+  const [executionResult, setExecutionResult] = useState<ExecutionResponse | null>(null);
+  const [ranAt, setRanAt] = useState<number | null>(null);
+  useEffect(() => {
+    setRanAt(executionResult ? Date.now() : null);
+  }, [executionResult]);
+  const [validationResult, setValidationResult] = useState<SwrlValidationResult | null>(null);
+  const [unmigrated, setUnmigrated] = useState<UnmigratedRule[]>([]);
+  const [copyingId, setCopyingId] = useState<string | null>(null);
+  const cloneInFlightRef = useRef(false);
+  const [isCloning, setIsCloning] = useState(false);
+  const [busyRules, setBusyRules] = useState<Record<string, 'delete' | 'toggle' | 'copy'>>({});
+  const busyRulesRef = useRef<Set<string>>(new Set());
+  const [assertedVersion, setAssertedVersion] = useState(0);
+  const controlSession = useControlSession(`${projectId}|${draftMode}`);
+  const [activePanel, setActivePanel] = useState<'editor' | 'results' | 'reference' | 'query' | 'control' | 'asserted' | 'owl2rl'>('editor');
+  const [expandedBuiltInCategory, setExpandedBuiltInCategory] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{ isOpen: boolean; ruleName: string; ruleId: string }>({ isOpen: false, ruleName: '', ruleId: '' });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [dynamicTemplates, setDynamicTemplates] = useState<typeof RULE_TEMPLATES>([]);
+  const [showRuleBuilder, setShowRuleBuilder] = useState(false);
+  const [ontologySchema, setOntologySchema] = useState<{ classes: string[], objectProperties: string[], dataProperties: string[] } | null>(null);
+
+  const [editForm, setEditForm] = useState({
+    ruleName: '',
+    ruleText: '',
+    comment: '',
+    category: '',
+    enabled: true
+  });
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const importFileRef = useRef<File | null>(null);
+  const importSessionRef = useRef<ImportSession | null>(null);
+  const [importPreview, setImportPreview] = useState<{ report: ImportReport; fileName: string } | null>(null);
+  const [importRunning, setImportRunning] = useState(false);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const debouncedRuleText = useDebounce(editForm.ruleText, 500);
+
+  const schemaNames = useMemo<OntologySchemaNames | null>(() => {
+    if (!ontologySchema) return null;
+    return {
+      classes: new Set(ontologySchema.classes.map(extractLocalName)),
+      objectProperties: new Set(ontologySchema.objectProperties.map(extractLocalName)),
+      dataProperties: new Set(ontologySchema.dataProperties.map(extractLocalName)),
+    };
+  }, [ontologySchema]);
+
+  const validGeneralTemplates = useMemo(
+    () => schemaNames
+      ? RULE_TEMPLATES.filter(t => templateMatchesOntology(t.template, schemaNames))
+      : [],
+    [schemaNames]
+  );
+
+  const loadOntologySchema = useCallback(async () => {
+    try {
+      console.log('[SWRL] Loading ontology schema for project:', projectId);
+      const res = await apiClient.get<{ classes: string[], objectProperties: string[], dataProperties: string[] }>(
+        `/api/ontology/${projectId}/schema`
+      );
+      console.log('[SWRL] Schema loaded:', res);
+      
+      const classes = res.classes.map(c => extractLocalName(c)).filter(c => c && !c.startsWith('owl:') && !c.startsWith('rdf:'));
+      const objProps = res.objectProperties.map(p => extractLocalName(p)).filter(p => p && !p.startsWith('owl:') && !p.startsWith('rdf:'));
+      const dataProps = res.dataProperties.map(p => extractLocalName(p)).filter(p => p && !p.startsWith('owl:') && !p.startsWith('rdf:'));
+      const schemaNames: OntologySchemaNames = {
+        classes: new Set(classes),
+        objectProperties: new Set(objProps),
+        dataProperties: new Set(dataProps),
+      };
+      setOntologySchema({ classes, objectProperties: objProps, dataProperties: dataProps });
+      
+      const generated: typeof RULE_TEMPLATES = [];
+      
+      classes.forEach((cls, idx) => {
+        if (dataProps.length > 0) {
+          const dataProp = dataProps[0];
+          const targetCls = classes[idx + 1] || `${cls}Classified`;
+          generated.push({
+            name: `${cls} Classification`,
+            template: `${cls}(?x) ^ ${dataProp}(?x, ?val) ^ swrlb:greaterThan(?val, 100) -> ${targetCls}(?x)`,
+            description: `Classify ${cls} into ${targetCls} when ${dataProp} > 100`
+          });
+        }
+        
+        if (dataProps.length > 0) {
+          const dataProp = dataProps[0];
+          generated.push({
+            name: `${cls} String Match`,
+            template: `${cls}(?x) ^ ${dataProp}(?x, ?str) ^ swrlb:contains(?str, "value") -> ${cls}Matched(?x)`,
+            description: `Classify ${cls} based on ${dataProp} containing specific text`
+          });
+        }
+        
+        if (dataProps.length > 0) {
+          const dataProp = dataProps[0];
+          generated.push({
+            name: `Query All ${cls}`,
+            template: `${cls}(?x) ^ ${dataProp}(?x, ?val) -> sqwrl:select(?x, ?val) ^ sqwrl:orderBy(?val)`,
+            description: `List all ${cls} instances ordered by ${dataProp}`
+          });
+        }
+      });
+      
+      for (let i = 0; i < Math.min(objProps.length, 3); i++) {
+        for (let j = 0; j < Math.min(objProps.length, 3); j++) {
+          if (i !== j && classes.length > 0) {
+            const prop1 = objProps[i];
+            const prop2 = objProps[j];
+            const inferredProp = `${prop1}${prop2}Chain`;
+            generated.push({
+              name: `${prop1} → ${prop2} Chain`,
+              template: `${prop1}(?x, ?y) ^ ${prop2}(?y, ?z) -> ${inferredProp}(?x, ?z)`,
+              description: `Infer ${inferredProp} through ${prop1} and ${prop2} property chain`
+            });
+          }
+        }
+      }
+      
+      if (dataProps.length >= 2 && classes.length > 0) {
+        const cls = classes[0];
+        const prop1 = dataProps[0];
+        const prop2 = dataProps[1];
+        
+        generated.push({
+          name: `${cls} Sum ${prop1}+${prop2}`,
+          template: `${cls}(?x) ^ ${prop1}(?x, ?v1) ^ ${prop2}(?x, ?v2) ^ swrlb:add(?sum, ?v1, ?v2) -> has${prop1}${prop2}Sum(?x, ?sum)`,
+          description: `Calculate sum of ${prop1} and ${prop2} for ${cls}`
+        });
+        
+        generated.push({
+          name: `${cls} ${prop1} × ${prop2}`,
+          template: `${cls}(?x) ^ ${prop1}(?x, ?v1) ^ ${prop2}(?x, ?v2) ^ swrlb:multiply(?product, ?v1, ?v2) -> has${prop1}${prop2}Product(?x, ?product)`,
+          description: `Calculate product of ${prop1} and ${prop2} for ${cls}`
+        });
+        
+        generated.push({
+          name: `${cls} ${prop1} > ${prop2}`,
+          template: `${cls}(?x) ^ ${prop1}(?x, ?v1) ^ ${prop2}(?x, ?v2) ^ swrlb:greaterThan(?v1, ?v2) -> has${prop1}Greater(?x, true)`,
+          description: `Check if ${prop1} exceeds ${prop2} for ${cls}`
+        });
+      }
+      
+      if (classes.length > 0 && objProps.length > 0) {
+        const cls = classes[0];
+        const objProp = objProps[0];
+        generated.push({
+          name: `${cls} Shared ${objProp}`,
+          template: `${cls}(?x) ^ ${cls}(?y) ^ ${objProp}(?x, ?ref) ^ ${objProp}(?y, ?ref) ^ swrlb:notEqual(?x, ?y) -> related${objProp}(?x, ?y)`,
+          description: `Find ${cls} instances sharing the same ${objProp}`
+        });
+      }
+      
+      if (classes.length > 0 && dataProps.length > 0) {
+        const cls = classes[0];
+        const prop = dataProps[0];
+        
+        generated.push({
+          name: `Count ${cls}`,
+          template: `${cls}(?x) -> sqwrl:count(?x)`,
+          description: `Count total number of ${cls} instances`
+        });
+        
+        generated.push({
+          name: `${cls} Min ${prop}`,
+          template: `${cls}(?x) ^ ${prop}(?x, ?val) -> sqwrl:min(?val)`,
+          description: `Find minimum ${prop} value in ${cls}`
+        });
+        
+        generated.push({
+          name: `${cls} Max ${prop}`,
+          template: `${cls}(?x) ^ ${prop}(?x, ?val) -> sqwrl:max(?val)`,
+          description: `Find maximum ${prop} value in ${cls}`
+        });
+        
+        generated.push({
+          name: `${cls} Avg ${prop}`,
+          template: `${cls}(?x) ^ ${prop}(?x, ?val) -> sqwrl:avg(?val)`,
+          description: `Calculate average ${prop} for all ${cls}`
+        });
+      }
+      
+      const validGenerated = generated.filter(t => templateMatchesOntology(t.template, schemaNames));
+      console.log('[SWRL] Generated', generated.length, 'dynamic templates;', validGenerated.length, 'match ontology schema');
+      setDynamicTemplates(validGenerated.slice(0, 20));
+      console.log('[SWRL] Set', Math.min(validGenerated.length, 20), 'dynamic templates');
+    } catch (e) {
+      console.error('[SWRL] Failed to load ontology schema:', e);
+      setDynamicTemplates([]);
+    }
+  }, [projectId, apiClient]);
+
+  useEffect(() => { loadOntologySchema(); }, [loadOntologySchema]);
+
+  const loadRules = useCallback(async () => {
+    const myVersion = rulesVersionRef.current;
+    setIsLoading(true);
+    setLoadError(null);
+    try {
+      const res = await apiClient.get<unknown>(withDraft(`/api/ontology/${projectId}/rules`, draftMode));
+      if (rulesVersionRef.current === myVersion) {
+        const parsed = normalizeRulesResponse(res);
+        setRules(parsed.rules);
+        setUnmigrated(parsed.unmigrated);
+      }
+    } catch (e) {
+      console.error('Failed to load rules:', e);
+      setLoadError(friendlyRuleError(e, 'Could not load the rules.'));
+    } finally {
+      setIsLoading(false);
+    }
+  }, [projectId, draftMode]);
+
+  const announceRuleChange = (op: string) => {
+    window.dispatchEvent(new CustomEvent('ontology:mutated', { detail: { projectId, ops: [op] } }));
+  };
+
+  useEffect(() => { loadRules(); }, [loadRules]);
+
+  useUndoRefresh(projectId, () => { void loadRules(); });
+
+  const savedRuleText = selectedRule ? selectedRule.ruleText : null;
+
+  useEffect(() => {
+    if (!isEditing || !needsValidation(debouncedRuleText, savedRuleText)) {
+      setValidationResult(null);
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const validate = async (attempt: number) => {
+      try {
+        const res = await apiClient.post<SwrlValidationResult>(
+          withDraft(`/api/swrl/${projectId}/validate`, draftMode),
+          { ruleText: debouncedRuleText }
+        );
+        if (!cancelled) setValidationResult(res);
+      } catch (e: any) {
+        if (cancelled) return;
+        if (e?.status === 429 && attempt < 3) {
+          setValidationResult({ valid: false, errorMessage: 'The rule engine is busy. Checking again in a moment.' });
+          timer = setTimeout(() => { void validate(attempt + 1); }, 3000);
+          return;
+        }
+        setValidationResult({
+          valid: false,
+          errorMessage: e?.status === 429 ? 'The rule engine is busy. Try again in a moment.' : 'Validation failed'
+        });
+      }
+    };
+    void validate(0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [debouncedRuleText, savedRuleText, projectId, isEditing, draftMode]);
+
+  const filteredRules = useMemo(() => {
+    if (!searchQuery.trim()) return rules;
+    const q = searchQuery.toLowerCase();
+    return rules.filter(r => 
+      r.ruleName.toLowerCase().includes(q) ||
+      r.ruleText.toLowerCase().includes(q) ||
+      (r.category || '').toLowerCase().includes(q)
+    );
+  }, [rules, searchQuery]);
+
+  const enabledCount = rules.filter(r => r.enabled).length;
+  const rulesCountText = isLoading ? 'Loading rules…' : loadError ? 'Rules unavailable' : `${enabledCount} of ${rules.length} rules enabled`;
+
+  const handleSelectRule = (rule: SwrlRule) => {
+    setSelectedRule(rule);
+    setEditForm({
+      ruleName: rule.ruleName,
+      ruleText: rule.ruleText,
+      comment: rule.comment || '',
+      category: rule.category || '',
+      enabled: rule.enabled
+    });
+    setIsEditing(false);
+    setValidationResult(null);
+    setSaveError(null);
+    setActivePanel('editor');
+  };
+
+  const handleNewRule = () => {
+    setSelectedRule(null);
+    setEditForm({
+      ruleName: 'New Rule',
+      ruleText: '',
+      comment: '',
+      category: '',
+      enabled: true
+    });
+    setIsEditing(true);
+    setValidationResult(null);
+    setSaveError(null);
+    setActivePanel('editor');
+  };
+
+  const handleSave = async () => {
+    if (!editForm.ruleName.trim() || !editForm.ruleText.trim()) return;
+    if (saveInFlightRef.current) return;
+    saveInFlightRef.current = true;
+    setIsSaving(true);
+    setSaveError(null);
+
+    try {
+      const body = ruleWriteBody(editForm, (selectedRule ? 'Edited rule ' : 'Added rule ') + editForm.ruleName.trim());
+      if (selectedRule) {
+        const res = ruleFromResponse<SwrlRule>(await apiClient.put<unknown>(
+          withDraft(`/api/ontology/${projectId}/rules/${selectedRule.id}`, draftMode),
+          body
+        ));
+        rulesVersionRef.current++;
+        const applied = applySavedRule(rules, selectedRule.id, res, editForm);
+        setRules(prev => applySavedRule(prev, selectedRule.id, res, editForm).rules);
+        setSelectedRule(applied.saved);
+        setEditForm(prev => ({ ...prev, ruleName: applied.saved.ruleName }));
+      } else {
+        const res = ruleFromResponse<SwrlRule>(await apiClient.post<unknown>(
+          withDraft(`/api/ontology/${projectId}/rules`, draftMode),
+          body
+        ));
+        rulesVersionRef.current++;
+        setRules([...rules, res]);
+        setSelectedRule(res);
+      }
+      setIsEditing(false);
+      announceRuleChange(selectedRule ? 'ruleUpdated' : 'ruleAdded');
+    } catch (e: any) {
+      console.error('Save failed:', e);
+      setSaveError(friendlyRuleError(e, 'Failed to save rule - please try again.'));
+    } finally {
+      saveInFlightRef.current = false;
+      setIsSaving(false);
+    }
+  };
+
+  const postFactOps = async (ops: FactOp[], label: string, run: ExecutionResponse | null): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const res = await apiClient.post<{ changeSetId?: string }>(
+        withDraft(`/api/ontology/mutations/${projectId}`, draftMode),
+        {
+          ops,
+          username: 'SWRL rules',
+          sessionId: `swrl-add-${Date.now()}`,
+          precondition: run?.stamp ?? null,
+          origin: { source: 'swrl-rules', label }
+        }
+      );
+      window.dispatchEvent(new CustomEvent('ontocode:committed-change', { detail: { projectId, direction: 'APPLY', changeSetId: res?.changeSetId } }));
+      return { ok: true, message: '' };
+    } catch (e: any) {
+      if (/stale|out of date|\(409\)|changed since/i.test(String(e?.message || ''))) {
+        return { ok: false, message: 'The ontology or the rules changed since you ran this. Run the rules again, then add.' };
+      }
+      return { ok: false, message: e?.data?.message || e?.message || 'Could not add the facts.' };
+    }
+  };
+
+  const handleAddConclusions = async (axioms: InferredAxiom[]): Promise<{ ok: boolean; message: string }> => {
+    const { ops } = axiomsToOps(axioms.filter(ax => ax.category !== 'structure'));
+    if (ops.length === 0) return { ok: false, message: 'Nothing to add: none of these can be written as simple facts.' };
+    const outcome = await postFactOps(ops, 'Added from rule results (' + ops.length + ' facts)', executionResult);
+    if (!outcome.ok) return outcome;
+    return { ok: true, message: `Added ${ops.length} fact${ops.length === 1 ? '' : 's'} to the ontology. You can undo this from the history.` };
+  };
+
+  const handleAddInferred = async (includeStructure: boolean): Promise<AddOutcome> => {
+    const run = executionResult;
+    if (!run || !run.success) return { ok: false, message: 'Run the rules first, then add the inferred facts.' };
+    const plan = inferredPlan(run, includeStructure);
+    let axioms: InferredAxiom[];
+    try {
+      axioms = await collectInferredAxioms(apiClient.get.bind(apiClient), projectId, run, draftMode, includeStructure, ADD_INFERRED_CAP);
+    } catch (e: any) {
+      if (isExpiredRunError(e)) return { ok: false, message: EXPIRED_RUN_MESSAGE };
+      return { ok: false, message: pageErrorMessage(e) };
+    }
+    const { ops, unsupported } = axiomsToOps(axioms);
+    if (ops.length === 0) return { ok: false, message: 'Nothing to add: none of these can be written as simple facts.' };
+    const outcome = await postFactOps(ops, `Added from the Control tab (${ops.length} inferred facts)`, run);
+    if (!outcome.ok) return outcome;
+    setAssertedVersion(v => v + 1);
+    const parts = [`Added ${formatCount(ops.length)} fact${ops.length === 1 ? '' : 's'} to the ontology. You can undo this from the history.`];
+    if (plan.overCap) parts.push(`Only the first ${formatCount(ADD_INFERRED_CAP)} of ${formatCount(plan.total)} are added in one go. Run the rules again to add the rest.`);
+    if (unsupported > 0) parts.push(`${formatCount(unsupported)} could not be written as simple facts and were left out.`);
+    return { ok: true, message: parts.join(' '), added: ops.length };
+  };
+
+  const startRuleBusy = (id: string, action: 'delete' | 'toggle' | 'copy') => {
+    if (busyRulesRef.current.has(id)) return false;
+    busyRulesRef.current.add(id);
+    setBusyRules(prev => ({ ...prev, [id]: action }));
+    return true;
+  };
+
+  const endRuleBusy = (id: string) => {
+    busyRulesRef.current.delete(id);
+    setBusyRules(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const handleMakeLocalCopy = async (rule: SwrlRule) => {
+    if (!startRuleBusy(rule.id, 'copy')) return;
+    setCopyingId(rule.id);
+    setRowError(null);
+    setSaveError(null);
+    try {
+      const body = localCopyBody({ ...rule, comment: rule.comment ?? '' }, rules.map(r => r.ruleName));
+      const res = ruleFromResponse<SwrlRule>(await apiClient.post<unknown>(
+        withDraft(`/api/ontology/${projectId}/rules`, draftMode),
+        { ...body, origin: { source: 'swrl-rules', label: 'Made a local copy of ' + rule.ruleName } }
+      ));
+      rulesVersionRef.current++;
+      setRules(prev => [...prev, res]);
+      handleSelectRule(res);
+      announceRuleChange('ruleAdded');
+    } catch (e: any) {
+      console.error('Copy failed:', e);
+      setRowError(friendlyRuleError(e, 'Could not make a local copy of this rule.'));
+    } finally {
+      endRuleBusy(rule.id);
+      setCopyingId(null);
+    }
+  };
+
+  const handleCloneRule = async (rule: SwrlRule) => {
+    if (cloneInFlightRef.current) return;
+    cloneInFlightRef.current = true;
+    setIsCloning(true);
+    setSaveError(null);
+    try {
+      const body = cloneRuleBody({ ...rule, comment: rule.comment ?? '' }, rules.map(r => r.ruleName));
+      const res = ruleFromResponse<SwrlRule>(await apiClient.post<unknown>(
+        withDraft(`/api/ontology/${projectId}/rules`, draftMode),
+        ruleWriteBody(body, 'Cloned rule ' + rule.ruleName)
+      ));
+      rulesVersionRef.current++;
+      setRules(prev => [...prev, res]);
+      handleSelectRule(res);
+      announceRuleChange('ruleAdded');
+    } catch (e: any) {
+      console.error('Clone failed:', e);
+      setSaveError(friendlyRuleError(e, 'Could not clone this rule.'));
+    } finally {
+      cloneInFlightRef.current = false;
+      setIsCloning(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    const ruleId = confirmDialog.ruleId;
+    if (!ruleId) return;
+    setConfirmDialog({ isOpen: false, ruleName: '', ruleId: '' });
+    if (!startRuleBusy(ruleId, 'delete')) return;
+    setRowError(null);
+    try {
+      try {
+        await apiClient.delete(withDraft(`/api/ontology/${projectId}/rules/${ruleId}`, draftMode));
+      } catch (e: any) {
+        if (e?.status !== 404) throw e;
+      }
+      rulesVersionRef.current++;
+      setRules(prev => prev.filter(r => r.id !== ruleId));
+      if (selectedRule?.id === ruleId) {
+        setSelectedRule(null);
+        setEditForm({ ruleName: '', ruleText: '', comment: '', category: '', enabled: true });
+      }
+      setSelectedRuleIds(prev => {
+        const next = new Set(prev);
+        next.delete(ruleId);
+        return next;
+      });
+      announceRuleChange('ruleDeleted');
+    } catch (e: any) {
+      console.error('Delete failed:', e);
+      setRowError(friendlyRuleError(e, 'Could not delete the rule.'));
+    } finally {
+      endRuleBusy(ruleId);
+    }
+  };
+
+  const handleToggleEnabled = async (rule: SwrlRule) => {
+    if (!startRuleBusy(rule.id, 'toggle')) return;
+    setRowError(null);
+    try {
+      const res = ruleFromResponse<SwrlRule>(await apiClient.put<unknown>(
+        withDraft(`/api/ontology/${projectId}/rules/${rule.id}`, draftMode),
+        ruleWriteBody(
+          { ruleName: rule.ruleName, ruleText: rule.ruleText, comment: rule.comment || '', category: rule.category || '', enabled: !rule.enabled },
+          (rule.enabled ? 'Turned off rule ' : 'Turned on rule ') + rule.ruleName
+        )
+      ));
+      rulesVersionRef.current++;
+      setRules(prev => prev.map(r => r.id === rule.id ? res : r));
+      if (selectedRule?.id === rule.id) {
+        setSelectedRule(res);
+        setEditForm(prev => ({ ...prev, enabled: res.enabled }));
+      }
+      announceRuleChange('ruleToggled');
+    } catch (e: any) {
+      console.error('Toggle failed:', e);
+      setRowError(friendlyRuleError(e, 'Could not change this rule.'));
+    } finally {
+      endRuleBusy(rule.id);
+    }
+  };
+
+  const toggleRuleSelection = (ruleId: string) => {
+    setSelectedRuleIds(prev => {
+      const next = new Set(prev);
+      if (next.has(ruleId)) next.delete(ruleId);
+      else next.add(ruleId);
+      return next;
+    });
+  };
+
+  const handleExecuteAll = async (): Promise<ExecutionResponse | null> => {
+    if (runInFlightRef.current) return null;
+    runInFlightRef.current = true;
+    setIsExecuting(true);
+    setExecutionResult(null);
+    setActivePanel(p => (p === 'control' ? p : 'results'));
+
+    try {
+      const res = await apiClient.post<ExecutionResponse>(withDraft(`/api/ontology/${projectId}/rules/execute`, draftMode));
+      setExecutionResult(res);
+      return res;
+    } catch (e) {
+      console.error('Execution failed:', e);
+      const failed = {
+        success: false,
+        errorMessage: 'Execution failed',
+        executionTimeMs: 0,
+        totalRulesExecuted: 0,
+        inferredAxiomsCount: 0,
+        inferredAxioms: []
+      } as ExecutionResponse;
+      setExecutionResult(failed);
+      return failed;
+    } finally {
+      runInFlightRef.current = false;
+      setIsExecuting(false);
+    }
+  };
+
+  const handleExecuteSelected = async (): Promise<ExecutionResponse | null> => {
+    if (selectedRuleIds.size === 0) return null;
+    if (runInFlightRef.current) return null;
+    runInFlightRef.current = true;
+    setIsExecuting(true);
+    setExecutionResult(null);
+    setActivePanel(p => (p === 'control' ? p : 'results'));
+
+    try {
+      const ruleIds = Array.from(selectedRuleIds);
+      const res = await apiClient.post<ExecutionResponse>(
+        withDraft(`/api/swrl/${projectId}/execute/selected`, draftMode),
+        { ruleIds }
+      );
+      setExecutionResult(res);
+      return res;
+    } catch (e) {
+      console.error('Execution failed:', e);
+      return null;
+    } finally {
+      runInFlightRef.current = false;
+      setIsExecuting(false);
+    }
+  };
+
+  const handleTestRule = async () => {
+    if (!selectedRule) return;
+    if (runInFlightRef.current) return;
+    runInFlightRef.current = true;
+    setIsExecuting(true);
+    setIsTesting(true);
+    setExecutionResult(null);
+    setActivePanel(p => (p === 'control' ? p : 'results'));
+
+    try {
+      const res = await apiClient.post<ExecutionResponse>(
+        withDraft(`/api/swrl/${projectId}/rules/${selectedRule.id}/test`, draftMode)
+      );
+      setExecutionResult(res);
+    } catch (e) {
+      console.error('Test failed:', e);
+    } finally {
+      runInFlightRef.current = false;
+      setIsTesting(false);
+      setIsExecuting(false);
+    }
+  };
+
+  const insertAtCursor = (text: string) => {
+    if (!textareaRef.current) {
+      setEditForm(prev => ({ ...prev, ruleText: prev.ruleText + text }));
+      return;
+    }
+    const el = textareaRef.current;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const newText = editForm.ruleText.slice(0, start) + text + editForm.ruleText.slice(end);
+    setEditForm(prev => ({ ...prev, ruleText: newText }));
+    setTimeout(() => {
+      el.focus();
+      el.setSelectionRange(start + text.length, start + text.length);
+    }, 0);
+  };
+
+  const triggerDownload = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleExportServer = async (format: 'xlsx' | 'json') => {
+    setImportError(null);
+    try {
+      const blob = await apiClient.getBlob(withDraft(`/api/ontology/${projectId}/rules/export?format=${format}`, draftMode));
+      triggerDownload(blob, `swrl-rules-${projectId}.${format}`);
+    } catch (e) {
+      console.error('Export failed:', e);
+      setImportError(importErrorMessage(e));
+    }
+  };
+
+  const handleDownloadTemplate = async () => {
+    setImportError(null);
+    try {
+      const blob = await apiClient.getBlob(`/api/ontology/${projectId}/rules/template.xlsx`);
+      triggerDownload(blob, 'swrl-rules-template.xlsx');
+    } catch (e) {
+      console.error('Template download failed:', e);
+      setImportError(importErrorMessage(e));
+    }
+  };
+
+  const runImport = async (dryRun: boolean) => {
+    const file = importFileRef.current;
+    const session = importSessionRef.current;
+    if (!file || !session) return;
+    setImportRunning(true);
+    setImportError(null);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      form.append('importId', session.importId);
+      if (!dryRun && importPreview?.report.previewStamp) form.append('previewStamp', importPreview.report.previewStamp);
+      const res = await apiClient.postForm<ImportReport>(
+        withDraft(`/api/ontology/${projectId}/rules/import?dryRun=${dryRun ? 'true' : 'false'}`, draftMode),
+        form
+      );
+      if (dryRun) {
+        setImportPreview({ report: { ...res, dryRun: true }, fileName: file.name });
+        return;
+      }
+      importFileRef.current = null;
+      importSessionRef.current = null;
+      setImportPreview(null);
+      setImportNotice(importOutcomeNotice(res));
+      rulesVersionRef.current++;
+      announceRuleChange('ruleAdded');
+      await loadRules();
+    } catch (err: any) {
+      const stale = staleImportReport(err);
+      if (stale) {
+        setImportPreview({ report: stale, fileName: file.name });
+      } else {
+        if (dryRun) setImportPreview(null);
+        setImportError(importErrorMessage(err));
+      }
+    } finally {
+      setImportRunning(false);
+    }
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!file) return;
+    setImportNotice(null);
+    setImportError(null);
+    if (!isImportFile(file.name)) {
+      setImportError('Choose an Excel (.xlsx) or JSON (.json) file.');
+      return;
+    }
+    importSessionRef.current = importSessionFor(importSessionRef.current, file);
+    importFileRef.current = file;
+    setImportPreview(null);
+    await runImport(true);
+  };
+
+  const closeImportPreview = () => {
+    if (importRunning) return;
+    setImportPreview(null);
+  };
+
+  return (
+    <div className="h-full flex flex-col bg-gray-50">
+      <header className="bg-white border-b border-gray-200 px-4 py-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold text-gray-900">SWRL Rule Editor</h1>
+            <p className="text-xs text-gray-500">{rulesCountText}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1 border-r border-gray-200 pr-2 mr-2">
+              <button onClick={() => handleExportServer('xlsx')} className="px-2 py-1.5 text-xs text-gray-600 hover:bg-gray-100 rounded-lg flex items-center gap-1" title="Export Excel">
+                <Download size={14} /> Export Excel
+              </button>
+              <button onClick={() => handleExportServer('json')} className="px-2 py-1.5 text-xs text-gray-600 hover:bg-gray-100 rounded-lg flex items-center gap-1" title="Export JSON">
+                <Download size={14} /> Export JSON
+              </button>
+              <button onClick={handleDownloadTemplate} className="px-2 py-1.5 text-xs text-gray-600 hover:bg-gray-100 rounded-lg flex items-center gap-1" title="Download Excel template">
+                <FileText size={14} /> Download Excel template
+              </button>
+              <button onClick={() => fileInputRef.current?.click()} disabled={importRunning} className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg disabled:opacity-50" title="Import">
+                <Upload size={16} />
+              </button>
+              <input ref={fileInputRef} type="file" accept=".xlsx,.json" onChange={handleImport} className="hidden" />
+              <button onClick={loadRules} className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg" title="Refresh">
+                <RefreshCw size={16} />
+              </button>
+            </div>
+
+            {selectedRuleIds.size > 0 && (
+              <button
+                onClick={handleExecuteSelected}
+                disabled={isExecuting}
+                className="flex items-center gap-2 px-3 py-1.5 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 disabled:bg-green-300"
+              >
+                {isExecuting ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+                Run {selectedRuleIds.size} Selected
+              </button>
+            )}
+            <button
+              onClick={handleExecuteAll}
+              disabled={isExecuting || isLoading || enabledCount === 0}
+              className="flex items-center gap-2 px-4 py-1.5 bg-purple-600 text-white text-sm rounded-lg hover:bg-purple-700 disabled:bg-purple-300"
+            >
+              {isExecuting ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+              {isExecuting && !isTesting ? 'Executing…' : `Execute All (${enabledCount})`}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {(importNotice || importError) && (
+        <div className={`px-4 py-2 text-sm border-b ${importError ? 'bg-red-50 text-red-700 border-red-200' : 'bg-green-50 text-green-700 border-green-200'}`} role="status">
+          {importError || importNotice}
+        </div>
+      )}
+
+      {importPreview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-label="Import preview">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200">
+              <h2 className="text-base font-bold text-gray-900">Preview, nothing saved</h2>
+              <p className="text-xs text-gray-500 mt-0.5">{importPreview.fileName}</p>
+              <p className="text-sm text-gray-800 mt-2" data-testid="import-summary">{importSummaryLine(importPreview.report, true)}</p>
+              {importPreview.report.message && (
+                <p className="text-sm text-amber-700 mt-1">{importPreview.report.message}</p>
+              )}
+            </div>
+            <div className="px-5 py-3 overflow-y-auto flex-1">
+              {importPreview.report.skipped.length === 0 ? (
+                <p className="text-sm text-gray-500">No rows were skipped.</p>
+              ) : (
+                <table className="w-full text-xs text-left">
+                  <thead>
+                    <tr className="text-gray-500 border-b border-gray-200">
+                      <th className="py-1 pr-2">Sheet</th>
+                      <th className="py-1 pr-2">Row</th>
+                      <th className="py-1 pr-2">Rule name</th>
+                      <th className="py-1 pr-2">Reason</th>
+                      <th className="py-1">Suggestions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {skippedRowsView(importPreview.report.skipped).map(r => (
+                      <tr key={r.key} className="border-b border-gray-100 align-top">
+                        <td className="py-1 pr-2">{r.sheet}</td>
+                        <td className="py-1 pr-2">{r.row}</td>
+                        <td className="py-1 pr-2">{r.ruleName}</td>
+                        <td className="py-1 pr-2">{r.reason}</td>
+                        <td className="py-1">{r.suggestions}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex justify-end gap-2">
+              <button
+                onClick={closeImportPreview}
+                disabled={importRunning}
+                className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => runImport(false)}
+                disabled={!canRunImport(importPreview.report, importRunning)}
+                className="px-4 py-2 text-sm font-medium text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:bg-purple-300 flex items-center gap-2"
+              >
+                {importRunning && <Loader2 size={14} className="animate-spin" />}
+                {importButtonLabel(importPreview.report)}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 flex overflow-hidden">
+        <aside className="w-72 bg-white border-r border-gray-200 flex flex-col">
+          <div className="p-3 border-b border-gray-100 space-y-2">
+            <button
+              onClick={handleNewRule}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700"
+            >
+              <Plus size={16} /> New Rule
+            </button>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search rules..."
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-sm text-black border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-200"
+              />
+            </div>
+            {rules.length > 0 && (
+              <div className="flex items-center gap-1 text-xs">
+                <button 
+                  onClick={() => setSelectedRuleIds(new Set(rules.map(r => r.id)))}
+                  className="px-2 py-1 text-purple-600 hover:bg-purple-50 rounded"
+                >
+                  All
+                </button>
+                <button 
+                  onClick={() => setSelectedRuleIds(new Set(rules.filter(r => r.enabled).map(r => r.id)))}
+                  className="px-2 py-1 text-purple-600 hover:bg-purple-50 rounded"
+                >
+                  Enabled
+                </button>
+                <button 
+                  onClick={() => setSelectedRuleIds(new Set())}
+                  className="px-2 py-1 text-gray-500 hover:bg-gray-100 rounded"
+                >
+                  None
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-y-auto">
+            {isLoading ? (
+              <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-gray-500">
+                <Loader2 className="w-8 h-8 text-purple-500 animate-spin" />
+                Loading rules…
+              </div>
+            ) : loadError ? (
+              <div className="p-6 flex flex-col items-center gap-3 text-center text-sm text-red-700" role="alert">
+                <div className="flex items-center gap-2">
+                  <AlertCircle size={14} />
+                  {loadError}
+                </div>
+                <button onClick={loadRules} className="px-3 py-1.5 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100">
+                  Retry
+                </button>
+              </div>
+            ) : filteredRules.length === 0 ? (
+              <div className="p-6 text-center text-gray-400">
+                {searchQuery ? 'No matching rules' : 'No rules yet'}
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-100">
+                {rowError && (
+                  <div className="px-3 py-2 flex items-start gap-2 text-xs bg-red-50 text-red-700" role="alert">
+                    <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                    {rowError}
+                  </div>
+                )}
+                {filteredRules.map(rule => (
+                  <RuleListItem
+                    key={rule.id}
+                    rule={rule}
+                    isSelected={selectedRule?.id === rule.id}
+                    isChecked={selectedRuleIds.has(rule.id)}
+                    onSelect={() => handleSelectRule(rule)}
+                    onToggle={() => toggleRuleSelection(rule.id)}
+                    onToggleEnabled={() => handleToggleEnabled(rule)}
+                    onDelete={() => setConfirmDialog({ isOpen: true, ruleName: rule.ruleName, ruleId: rule.id })}
+                    onMakeLocalCopy={() => handleMakeLocalCopy(rule)}
+                    isCopying={copyingId === rule.id}
+                    busyAction={busyRules[rule.id] ?? null}
+                  />
+                ))}
+              </div>
+            )}
+            {!isLoading && unmigrated.length > 0 && (
+              <div className="m-3 p-3 text-xs bg-amber-50 border border-amber-200 rounded-lg text-amber-900">
+                <div className="font-semibold">{unmigratedNotice(unmigrated.length)}</div>
+                <ul className="mt-1 space-y-1">
+                  {unmigrated.map((u, i) => (
+                    <li key={u.id || `${u.ruleName}-${i}`}>
+                      <span className="font-medium">{u.ruleName}</span>
+                      {u.error ? <span>: {u.error}</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {!isLoading && hasDisabledRule(rules) && (
+              <p className="px-3 py-2 text-[11px] text-gray-500">
+                Disabled rules are saved in the ontology file. Other tools do not know they are disabled and will run them.
+              </p>
+            )}
+          </div>
+        </aside>
+
+        <main className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex items-center gap-1 px-4 py-2 bg-white border-b border-gray-200">
+            <button
+              onClick={() => setActivePanel('editor')}
+              className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                activePanel === 'editor' 
+                  ? 'bg-purple-100 text-purple-700' 
+                  : 'text-gray-600 hover:bg-gray-100'
+              }`}
+            >
+              <Code size={14} /> Editor
+            </button>
+            <button
+              onClick={() => setActivePanel('results')}
+              className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                activePanel === 'results' 
+                  ? 'bg-purple-100 text-purple-700' 
+                  : 'text-gray-600 hover:bg-gray-100'
+              }`}
+            >
+              <BarChart2 size={14} /> Inferred Axioms
+              {executionResult && (
+                <span className={`ml-1 px-1.5 py-0.5 text-[10px] rounded-full ${
+                  executionResult.success ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                }`}>
+                  {inferredTotal(executionResult)}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setActivePanel('reference')}
+              className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                activePanel === 'reference' 
+                  ? 'bg-purple-100 text-purple-700' 
+                  : 'text-gray-600 hover:bg-gray-100'
+              }`}
+            >
+              <BookOpen size={14} /> Reference
+            </button>
+            <button
+              onClick={() => setActivePanel('query')}
+              className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                activePanel === 'query' 
+                  ? 'bg-purple-100 text-purple-700' 
+                  : 'text-gray-600 hover:bg-gray-100'
+              }`}
+            >
+              <Search size={14} /> SQWRL Query
+            </button>
+            {([
+              ['control', 'Control', Zap, 'Run the rules and see a summary of the last run'],
+              ['asserted', 'Asserted Axioms', List, 'Asserted means typed into the ontology, as opposed to worked out by a reasoner'],
+              ['owl2rl', 'OWL 2 RL', Sparkles, 'Work out every fact that follows from the ontology using the standard OWL 2 RL rules'],
+            ] as const).map(([id, label, Icon, hint]) => (
+              <button
+                key={id}
+                onClick={() => setActivePanel(id)}
+                title={hint}
+                className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                  activePanel === id ? 'bg-purple-100 text-purple-700' : 'text-gray-600 hover:bg-gray-100'
+                }`}
+              >
+                <Icon size={14} /> {label}
+              </button>
+            ))}
+          </div>
+
+          {activePanel === 'editor' ? (
+            <div className="flex-1 overflow-y-auto p-4">
+              {!selectedRule && !isEditing ? (
+                <div className="h-full flex items-center justify-center">
+                  <div className="text-center max-w-sm">
+                    <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <FileText className="w-10 h-10 text-gray-400" />
+                    </div>
+                    <h3 className="font-semibold text-gray-700 mb-2">Select a Rule</h3>
+                    <p className="text-sm text-gray-500 mb-4">
+                      Choose a rule from the list to view or edit, or create a new one.
+                    </p>
+                    <button
+                      onClick={handleNewRule}
+                      className="inline-flex items-center gap-2 px-4 py-2 bg-purple-600 text-white text-sm rounded-lg hover:bg-purple-700"
+                    >
+                      <Plus size={16} /> Create New Rule
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="max-w-3xl mx-auto space-y-4">
+                  <div className="bg-white rounded-xl border border-gray-200 p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <label className="text-sm font-semibold text-gray-700">Rule Name</label>
+                      {!isEditing && selectedRule && !isImportedRule(selectedRule) && (
+                        <button
+                          onClick={() => setIsEditing(true)}
+                          className="px-3 py-1 text-xs font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100"
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      type="text"
+                      value={editForm.ruleName}
+                      onChange={e => setEditForm(prev => ({ ...prev, ruleName: e.target.value }))}
+                      disabled={!isEditing}
+                      className="w-full px-4 py-2.5 text-base text-black font-medium border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-200 disabled:bg-gray-50 disabled:text-gray-600"
+                      placeholder="Enter rule name"
+                    />
+                    
+                    <div className="grid grid-cols-2 gap-4 mt-4">
+                      <div>
+                        <label className="text-xs font-medium text-gray-500 mb-1 block">Category</label>
+                        <input
+                          type="text"
+                          value={editForm.category}
+                          onChange={e => setEditForm(prev => ({ ...prev, category: e.target.value }))}
+                          disabled={!isEditing}
+                          className="w-full px-3 py-2 text-sm text-black border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-200 disabled:bg-gray-50"
+                          placeholder="e.g., Classification"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs font-medium text-gray-500 mb-1 block">Status</label>
+                        <button
+                          onClick={() => isEditing && setEditForm(prev => ({ ...prev, enabled: !prev.enabled }))}
+                          disabled={!isEditing}
+                          className={`w-full px-3 py-2 text-sm font-medium rounded-lg border flex items-center gap-2 transition-colors ${
+                            editForm.enabled
+                              ? 'bg-green-50 border-green-200 text-green-700'
+                              : 'bg-gray-50 border-gray-200 text-gray-500'
+                          } ${!isEditing ? 'cursor-not-allowed' : 'cursor-pointer hover:shadow-sm'}`}
+                        >
+                          {editForm.enabled ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
+                          {editForm.enabled ? 'Enabled' : 'Disabled'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                    <div className="flex items-center justify-between px-4 py-3 bg-gray-50 border-b border-gray-200">
+                      <label className="text-sm font-semibold text-gray-700">SWRL Expression</label>
+                      <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setShowRuleBuilder(true)}
+                        disabled={!isEditing}
+                        className="px-3 py-1 text-xs font-medium text-purple-700 bg-white border border-purple-200 rounded-lg hover:bg-purple-50 disabled:opacity-50"
+                      >
+                        Build rule
+                      </button>
+                      <div className="relative group">
+                        <button className="px-3 py-1 text-xs font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 flex items-center gap-1">
+                          <BookOpen size={12} /> Templates
+                          <ChevronDown size={12} />
+                        </button>
+                        <div className="absolute right-0 top-full mt-1 w-80 max-h-96 overflow-y-auto bg-white border border-gray-200 rounded-lg shadow-xl z-50 hidden group-hover:block">
+                          {dynamicTemplates.length > 0 && (
+                            <div>
+                              <div className="sticky top-0 px-3 py-2 text-[10px] font-semibold text-green-700 bg-green-50 border-b border-green-200 flex items-center gap-1">
+                                <Sparkles size={10} /> Ontology-Based Templates ({dynamicTemplates.length})
+                              </div>
+                              {dynamicTemplates.map((t, i) => (
+                                <button
+                                  key={`dyn-${i}`}
+                                  onClick={() => setEditForm(prev => ({ ...prev, ruleText: t.template }))}
+                                  className="w-full text-left px-3 py-2 text-xs hover:bg-green-50 border-b border-gray-100"
+                                >
+                                  <div className="font-medium text-green-800">{t.name}</div>
+                                  <div className="text-[10px] text-green-600 truncate">{t.description}</div>
+                                </button>
+                              ))}
+                              <div className="px-3 py-2 text-[10px] font-semibold text-purple-700 bg-purple-50 border-b border-purple-200">
+                                General Templates ({validGeneralTemplates.length})
+                              </div>
+                            </div>
+                          )}
+                          {validGeneralTemplates.length > 0 ? validGeneralTemplates.map((t, i) => (
+                            <button
+                              key={i}
+                              onClick={() => setEditForm(prev => ({ ...prev, ruleText: t.template }))}
+                              className="w-full text-left px-3 py-2 text-xs hover:bg-purple-50 border-b border-gray-100 last:border-0"
+                            >
+                              <div className="font-medium text-gray-800">{t.name}</div>
+                              <div className="text-[10px] text-gray-500 truncate">{t.description}</div>
+                            </button>
+                          )) : (
+                            <div className="px-3 py-3 text-xs text-gray-500">
+                              {ontologySchema
+                                ? 'No templates match this ontology schema. Add the needed classes/properties first.'
+                                : 'Loading ontology schema before showing templates...'}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      </div>
+                    </div>
+
+                    {showRuleBuilder && isEditing && (
+                      <RuleBuilder
+                        ruleText={editForm.ruleText}
+                        schema={ontologySchema}
+                        onUse={text => setEditForm(prev => ({ ...prev, ruleText: text }))}
+                        onClose={() => setShowRuleBuilder(false)}
+                      />
+                    )}
+
+                    <textarea
+                      ref={textareaRef}
+                      value={editForm.ruleText}
+                      onChange={e => setEditForm(prev => ({ ...prev, ruleText: e.target.value }))}
+                      disabled={!isEditing}
+                      className="w-full h-32 px-4 py-3 font-mono text-sm resize-none focus:outline-none disabled:bg-gray-50 bg-white text-black disabled:text-gray-700"
+                      placeholder="Person(?p) ^ hasAge(?p, ?age) ^ swrlb:greaterThan(?age, 18) -> Adult(?p)"
+                    />
+
+                    <div className="min-h-[2.5rem]">
+                      {isEditing && validationResult && (
+                        <div className={`px-4 py-2 flex items-center gap-2 text-sm ${
+                          validationResult.valid ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
+                        }`}>
+                          {validationResult.valid ? <Check size={14} /> : <AlertCircle size={14} />}
+                          {validationResult.valid ? 'Valid syntax' : validationResult.errorMessage}
+                        </div>
+                      )}
+                    </div>
+
+                    {saveError && (
+                      <div className="px-4 py-2 flex items-center gap-2 text-sm bg-red-50 text-red-700 border-t border-red-100">
+                        <AlertCircle size={14} />
+                        {saveError}
+                      </div>
+                    )}
+
+                    <QuickInsertPanel
+                      onInsert={insertAtCursor}
+                      disabled={!isEditing}
+                      dynamicTemplates={dynamicTemplates}
+                      generalTemplates={validGeneralTemplates}
+                      schemaLoaded={!!ontologySchema}
+                    />
+                  </div>
+
+                  <div className="bg-white rounded-xl border border-gray-200 p-4">
+                    <label className="text-sm font-semibold text-gray-700 mb-2 block">Description</label>
+                    <textarea
+                      value={editForm.comment}
+                      onChange={e => setEditForm(prev => ({ ...prev, comment: e.target.value }))}
+                      disabled={!isEditing}
+                      className="w-full h-20 px-3 py-2 text-sm border border-gray-200 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-purple-200 disabled:bg-gray-50 bg-white text-black"
+                      placeholder="Add notes or documentation..."
+                    />
+                  </div>
+
+                  {isEditing ? (
+                    <div className="flex items-center gap-3 pt-2">
+                      <button
+                        onClick={() => setConfirmDialog({ isOpen: true, ruleName: selectedRule?.ruleName || '', ruleId: selectedRule?.id || '' })}
+                        disabled={!selectedRule || isSaving}
+                        className="px-4 py-2 text-sm font-medium text-red-600 bg-red-50 rounded-lg hover:bg-red-100 disabled:opacity-50 flex items-center gap-2"
+                      >
+                        <Trash2 size={14} /> Delete
+                      </button>
+                      <div className="flex-1" />
+                      {selectedRule && (
+                        <button
+                          onClick={() => handleCloneRule(selectedRule)}
+                          disabled={isCloning || isSaving}
+                          title="Make a copy of this rule under a new name"
+                          className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50 flex items-center gap-2"
+                        >
+                          {isCloning ? <Loader2 size={14} className="animate-spin" /> : <Copy size={14} />} Clone
+                        </button>
+                      )}
+                      <button
+                        onClick={handleTestRule}
+                        disabled={!selectedRule || !editForm.ruleText.trim() || isExecuting || isSaving}
+                        className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {isTesting ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} {isTesting ? 'Testing…' : 'Test'}
+                      </button>
+                      <button
+                        disabled={isSaving}
+                        onClick={() => {
+                          setIsEditing(false);
+                          if (selectedRule) handleSelectRule(selectedRule);
+                        }}
+                        className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSave}
+                        disabled={!editForm.ruleName.trim() || !editForm.ruleText.trim() || isSaving}
+                        className="px-5 py-2 text-sm font-medium text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:bg-purple-300 flex items-center gap-2"
+                      >
+                        {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                        {isSaving ? 'Saving…' : selectedRule ? 'Update' : 'Save'}
+                      </button>
+                    </div>
+                  ) : selectedRule && isImportedRule(selectedRule) ? (
+                    <div className="flex flex-col gap-3 pt-2">
+                      <div className="text-sm text-gray-600">{sourceLabel(selectedRule)}. This rule is read-only here.</div>
+                      <WhyNotPanel projectId={projectId} ruleId={selectedRule.id} draftMode={draftMode} />
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1" />
+                        <button
+                          onClick={() => handleMakeLocalCopy(selectedRule)}
+                          disabled={copyingId === selectedRule.id}
+                          className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+                        >
+                          Make a local copy
+                        </button>
+                        <button
+                          onClick={() => handleCloneRule(selectedRule)}
+                          disabled={isCloning}
+                          title="Make a copy of this rule under a new name"
+                          className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+                        >
+                          Clone
+                        </button>
+                      </div>
+                    </div>
+                  ) : selectedRule && (
+                    <div className="flex flex-col gap-3 pt-2">
+                    <WhyNotPanel projectId={projectId} ruleId={selectedRule.id} draftMode={draftMode} />
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => setConfirmDialog({ isOpen: true, ruleName: selectedRule.ruleName, ruleId: selectedRule.id })}
+                        className="px-4 py-2 text-sm font-medium text-red-600 bg-red-50 rounded-lg hover:bg-red-100 flex items-center gap-2"
+                      >
+                        <Trash2 size={14} /> Delete
+                      </button>
+                      <div className="flex-1" />
+                      <button
+                        onClick={() => handleCloneRule(selectedRule)}
+                        disabled={isCloning}
+                        title="Make a copy of this rule under a new name"
+                        className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {isCloning ? <Loader2 size={14} className="animate-spin" /> : <Copy size={14} />} Clone
+                      </button>
+                      <button
+                        onClick={handleTestRule}
+                        disabled={!editForm.ruleText.trim() || isExecuting}
+                        className="px-4 py-2 text-sm font-medium text-purple-600 bg-purple-50 rounded-lg hover:bg-purple-100 disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {isTesting ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} {isTesting ? 'Testing…' : 'Test'}
+                      </button>
+                      <button
+                        onClick={() => setIsEditing(true)}
+                        className="px-5 py-2 text-sm font-medium text-white bg-purple-600 rounded-lg hover:bg-purple-700 flex items-center gap-2"
+                      >
+                        <Code size={14} /> Edit
+                      </button>
+                    </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : activePanel === 'results' ? (
+            <ResultsPanel projectId={projectId} draftMode={draftMode} results={executionResult} isExecuting={isExecuting} onAdd={handleAddConclusions} onRerun={executionResult?.executionMode === 'selected' ? handleExecuteSelected : handleExecuteAll} rules={rules} />
+          ) : activePanel === 'control' ? (
+            <ControlPanel
+              projectId={projectId}
+              draftMode={draftMode}
+              session={controlSession}
+              onAddInferred={handleAddInferred}
+              result={executionResult}
+              isExecuting={isExecuting}
+              enabledCount={enabledCount}
+              selectedCount={selectedRuleIds.size}
+              onRunAll={handleExecuteAll}
+              onRunSelected={handleExecuteSelected}
+              onClear={() => setExecutionResult(null)}
+              rules={rules}
+              selectedIds={selectedRuleIds}
+              onToggleRule={toggleRuleSelection}
+              onSelectAllEnabled={() => setSelectedRuleIds(new Set(rules.filter(r => r.enabled && !isSqwrlRule(r)).map(r => r.id)))}
+              onSelectNone={() => setSelectedRuleIds(new Set())}
+              ranAt={ranAt}
+            />
+          ) : activePanel === 'asserted' ? (
+            <AssertedAxiomsPanel key={assertedVersion} projectId={projectId} draftMode={draftMode} />
+          ) : activePanel === 'owl2rl' ? (
+            <Owl2RlPanel projectId={projectId} draftMode={draftMode} />
+          ) : activePanel === 'query' ? (
+            <SQWRLQueryPanel projectId={projectId} context={context!} draftMode={draftMode} />
+          ) : (
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              <div className="text-sm text-gray-600 mb-4">
+                <p>Functions you can use in rules and queries. Click one to insert it into your rule. Functions marked "Not available" are listed so you know they exist, but the rule engine cannot run them.</p>
+              </div>
+              {SWRL_BUILTINS.map(category => (
+                <div key={category.name} className="border border-gray-200 rounded-lg overflow-hidden">
+                  <button
+                    onClick={() => setExpandedBuiltInCategory(expandedBuiltInCategory === category.name ? null : category.name)}
+                    className="w-full flex items-center justify-between p-3 bg-gray-50 hover:bg-gray-100 text-left transition-colors"
+                  >
+                    <div>
+                      <span className="font-semibold text-gray-800">{category.name}</span>
+                      <span className="text-xs text-purple-600 ml-2 font-mono">{category.prefix}:</span>
+                    </div>
+                    {expandedBuiltInCategory === category.name ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  </button>
+                  {expandedBuiltInCategory === category.name && (
+                    <div className="divide-y divide-gray-100 max-h-96 overflow-y-auto bg-white">
+                      {category.builtIns.map(builtin => (
+                        <div
+                          key={builtin.name}
+                          onClick={() => {
+                            if (isEditing && builtin.status !== 'unavailable') {
+                              setEditForm(prev => ({
+                                ...prev,
+                                ruleText: prev.ruleText + (prev.ruleText ? ' ^ ' : '') + builtin.signature
+                              }));
+                              setActivePanel('editor');
+                            }
+                          }}
+                          className={`p-3 transition-colors ${builtin.status === 'unavailable' ? 'opacity-60 cursor-not-allowed' : `hover:bg-purple-50 ${isEditing ? 'cursor-pointer' : 'cursor-default'}`}`}
+                          data-testid={`builtin-${builtin.fullName}`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <code className="text-sm font-mono bg-purple-100 text-purple-800 px-2 py-0.5 rounded border border-purple-200">{builtin.fullName}</code>
+                            {builtin.status === 'unavailable' ? <span className="text-xs text-red-600">Not available</span> : builtin.status === 'caution' ? <span className="text-xs text-amber-600">Works with limits</span> : isEditing && <span className="text-xs text-gray-400">Click to insert</span>}
+                          </div>
+                          <p className="text-xs text-gray-600 mb-1">{builtin.description}</p>
+                          {builtin.note && <p className="text-xs text-amber-700 mb-1">{builtin.note}</p>}
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono text-gray-500 bg-gray-100 px-2 py-0.5 rounded">{builtin.signature}</span>
+                            {builtin.example && (
+                              <span className="text-xs text-gray-400">Ex: <code className="bg-gray-50 px-1 rounded">{builtin.example}</code></span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </main>
+      </div>
+
+      <ConfirmDialog
+        isOpen={confirmDialog.isOpen}
+        title="Delete Rule"
+        message={`Are you sure you want to delete "${confirmDialog.ruleName}"? You can undo this from the history.`}
+        onConfirm={handleDelete}
+        onCancel={() => setConfirmDialog({ isOpen: false, ruleName: '', ruleId: '' })}
+        confirmText="Delete"
+        danger
+      />
+    </div>
+  );
+};
+
+export default SWRLEditor;

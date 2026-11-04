@@ -1,0 +1,136 @@
+package self.research.ontology.auth.service;
+
+import org.springframework.stereotype.Service;
+import self.research.ontology.auth.model.Invitation;
+import self.research.ontology.auth.model.Workspace;
+import self.research.ontology.auth.repository.InvitationRepository;
+import self.research.ontology.auth.repository.WorkspaceRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.LocalDateTime;
+import java.util.Optional;
+import java.util.UUID;
+
+@Service
+public class InvitationService {
+
+    private static final Logger log = LoggerFactory.getLogger(InvitationService.class);
+
+    private final InvitationRepository invitationRepository;
+    private final WorkspaceRepository workspaceRepository;
+    private final EmailService emailService;
+
+    public InvitationService(InvitationRepository invitationRepository,
+                            WorkspaceRepository workspaceRepository,
+                            EmailService emailService) {
+        this.invitationRepository = invitationRepository;
+        this.workspaceRepository = workspaceRepository;
+        this.emailService = emailService;
+    }
+
+    public Invitation createInvitation(String workspaceId, String inviteeEmail, String role,
+                                      String invitedBy, String invitedByEmail) {
+
+        Optional<Workspace> workspaceOpt = workspaceRepository.findByWorkspaceId(workspaceId);
+        if (workspaceOpt.isEmpty()) {
+            throw new IllegalArgumentException("Workspace not found");
+        }
+
+        Workspace workspace = workspaceOpt.get();
+
+        Optional<Invitation> existingInvitation = invitationRepository
+            .findByInviteeEmailAndWorkspaceIdAndStatus(inviteeEmail, workspaceId, "PENDING");
+
+        Invitation invitation;
+
+        if (existingInvitation.isPresent()) {
+
+            invitation = existingInvitation.get();
+            log.info("Found existing pending invitation for: {}. Resending...", inviteeEmail);
+
+            invitation.setCreatedAt(java.time.LocalDateTime.now());
+            invitation = invitationRepository.save(invitation);
+        } else {
+
+            invitation = new Invitation();
+            invitation.setInvitationToken(generateInvitationToken());
+            invitation.setInviteeEmail(inviteeEmail);
+            invitation.setWorkspaceId(workspaceId);
+            invitation.setWorkspaceName(workspace.getName());
+            invitation.setInvitedBy(invitedBy);
+            invitation.setInvitedByEmail(invitedByEmail);
+            invitation.setRole(role);
+
+            invitation = invitationRepository.save(invitation);
+            log.info("Created new invitation for: {}", inviteeEmail);
+        }
+
+        try {
+            emailService.sendInvitationEmail(invitation);
+            log.info("Invitation email sent successfully to: {}", inviteeEmail);
+        } catch (Exception e) {
+            log.error("Failed to send invitation email to: {}", inviteeEmail, e);
+            log.error("Email service error details: ", e);
+
+        }
+
+        return invitation;
+    }
+
+    public Optional<Invitation> getInvitationByToken(String token) {
+        return invitationRepository.findByInvitationToken(token);
+    }
+
+    public Invitation acceptInvitation(String token, String userId) {
+        Optional<Invitation> invitationOpt = invitationRepository.findByInvitationToken(token);
+
+        if (invitationOpt.isEmpty()) {
+            throw new IllegalArgumentException("Invitation not found");
+        }
+
+        Invitation invitation = invitationOpt.get();
+
+        if (!invitation.isPending()) {
+            throw new IllegalArgumentException("Invitation is not pending");
+        }
+
+        invitation.setStatus("ACCEPTED");
+        invitation.setAcceptedAt(LocalDateTime.now());
+
+        return invitationRepository.save(invitation);
+    }
+
+    private String generateInvitationToken() {
+        String token;
+        do {
+            token = UUID.randomUUID().toString().replace("-", "");
+        } while (invitationRepository.existsByInvitationToken(token));
+        return token;
+    }
+
+    public Iterable<Invitation> getPendingInvitations(String workspaceId) {
+        return invitationRepository.findByWorkspaceIdAndStatus(workspaceId, "PENDING");
+    }
+
+    public void cancelInvitation(String token) {
+        Optional<Invitation> invitationOpt = invitationRepository.findByInvitationToken(token);
+        if (invitationOpt.isPresent()) {
+            Invitation invitation = invitationOpt.get();
+            invitation.setStatus("CANCELLED");
+            invitationRepository.save(invitation);
+        }
+    }
+
+    public Optional<Invitation> findByEmailAndWorkspace(String email, String workspaceId) {
+        return invitationRepository.findByInviteeEmailAndWorkspaceId(email, workspaceId);
+    }
+
+    public Invitation saveInvitation(Invitation invitation) {
+        return invitationRepository.save(invitation);
+    }
+
+    public void sendInvitationEmail(Invitation invitation, Workspace workspace) {
+        emailService.sendInvitationEmail(invitation);
+    }
+}

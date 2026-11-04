@@ -1,0 +1,27 @@
+package self.research.ontology.owlEditor.service;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class GeneralClassAxiomService {
+
+    private final ManchesterExpressionService manchesterExpressionService;
+
+    public GeneralClassAxiomService(ManchesterExpressionService manchesterExpressionService) {
+        this.manchesterExpressionService = manchesterExpressionService;
+    }
+
+    public void addGeneralClassAxiom(String projectId, String subClassExpr, String superClassExpr) throws Exception {
+        manchesterExpressionService.addGeneralClassAxiom(projectId, subClassExpr, superClassExpr);
+    }
+
+    public boolean deleteGeneralClassAxiom(String projectId, String value, boolean draft, String userId,
+                                           String username) throws Exception {
+        return manchesterExpressionService.deleteGeneralClassAxiom(projectId, value, draft, userId, username);
+    }
+
+    public void addGeneralClassAxiom(String projectId, String subClassExpr, String superClassExpr,
+                                     boolean draft, String userId, String username) throws Exception {
+        manchesterExpressionService.addGeneralClassAxiom(projectId, subClassExpr, superClassExpr, draft, userId, username);
+    }
+}
