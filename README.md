@@ -5,6 +5,7 @@
 A **microservices-based ontology editing platform** with a **VS Code extension** and **web editor** for ontology authoring, visualization, reasoning, and collaboration.
 
 [![Report a bug](https://img.shields.io/badge/Report%20a%20bug-d73a4a)](https://ontocode.selfresearch.org/report-bug) [![Request a feature](https://img.shields.io/badge/Request%20a%20feature-0e8a16)](https://ontocode.selfresearch.org/request-feature) [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red)](https://github.com/sponsors/The-Self-Research-Institute) [![Donate](https://img.shields.io/badge/Donate-selfresearch.org-blueviolet)](https://selfresearch.org/donate) [![VS Code Marketplace](https://img.shields.io/badge/VS%20Code-Marketplace-blue?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=SelfResearchInstitute.ontocode-studio)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraneshkk1-dotcom%2Ftesting.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraneshkk1-dotcom%2Ftesting?ref=badge_shield)
 
 ---
 
@@ -393,3 +394,6 @@ See also [CITATION.cff](CITATION.cff).
 ## License
 
 [MIT License](LICENSE)
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraneshkk1-dotcom%2Ftesting.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraneshkk1-dotcom%2Ftesting?ref=badge_large)
