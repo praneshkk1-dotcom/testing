@@ -135,10 +135,10 @@ jobs:
           "pkg-config used by meson: $env:PKG_CONFIG"
           "pkg-config search folder: $env:PKG_CONFIG_PATH"
           Get-ChildItem $env:PKG_CONFIG_PATH -Filter *.pc | Select-Object -ExpandProperty Name
-          foreach ($m in 'icu-uc','icu-i18n','zlib','liblz4','libzstd') { pkg-config --modversion $m; if ($LASTEXITCODE -ne 0) { "pkg-config cannot find $m" } }
+          foreach ($m in 'zlib','liblz4','libzstd') { pkg-config --modversion $m; if ($LASTEXITCODE -ne 0) { "pkg-config cannot find $m" } }
           Set-Location pgsrc
           meson setup build --buildtype=release "--prefix=$env:PG_PREFIX" `
-            -Dicu=enabled -Dzlib=enabled -Dlz4=enabled -Dzstd=enabled -Dssl=none -Dnls=disabled `
+            -Dicu=disabled -Dzlib=enabled -Dlz4=enabled -Dzstd=enabled -Dssl=none -Dnls=disabled `
             -Dtap_tests=disabled -Dplperl=disabled -Dplpython=disabled -Dpltcl=disabled `
             "-Dextra_include_dirs=$inst\include" "-Dextra_lib_dirs=$inst\lib"
           if ($LASTEXITCODE -ne 0) { throw "meson setup failed" }
@@ -152,7 +152,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pg = $env:PG_PREFIX
           $inst = "$env:VCPKG_DIR\installed\arm64-windows"
-          Copy-Item "$inst\bin\*.dll" "$pg\bin" -Force
+          Get-ChildItem "$inst\bin\*.dll" | Where-Object { $_.Name -notlike 'icu*' } | Copy-Item -Destination "$pg\bin" -Force
           $crt = Get-ChildItem "$env:VS_ROOT\VC\Redist\MSVC" -Recurse -Directory -Filter 'Microsoft.VC*.CRT' |
             Where-Object { $_.FullName -match '\\arm64\\' -and $_.FullName -notmatch 'onecore|debug' } | Select-Object -First 1
           "CRT folder: $($crt.FullName)"
@@ -220,9 +220,6 @@ jobs:
           $pw = 'smoke-test-password-0123456789'
           Set-Content pw.txt $pw -NoNewline -Encoding ascii
 
-          "--- ICU files next to the programs ---"
-          Get-ChildItem "$pg\bin" -Filter 'icu*.dll' | ForEach-Object { "{0}  {1:N0} bytes" -f $_.Name, $_.Length }
-
           "--- DLLs our programs import that are missing ---"
           $present = @{}; Get-ChildItem "$pg\bin" -Filter *.dll | ForEach-Object { $present[$_.Name.ToLower()] = $true }
           $sys = "$env:windir\System32"
@@ -252,12 +249,8 @@ jobs:
           }
 
           $mode = $null
-          if (Invoke-Initdb 'ICU en-US' 'C:\pgdata' @('--locale=C', '--locale-provider=icu', '--icu-locale=en-US')) { $mode = 'ICU en-US' }
-          else {
-            "ICU failed, trying the same fallback as the desktop app (plain C collation)"
-            if (Invoke-Initdb 'plain C' 'C:\pgdata' @('--locale=C')) { $mode = 'plain C (fallback)' }
-          }
-          if (-not $mode) { throw "initdb failed in both modes" }
+          if (Invoke-Initdb 'plain C (no ICU)' 'C:\pgdata' @('--locale=C')) { $mode = 'plain C (this build has no ICU)' }
+          if (-not $mode) { throw "initdb failed" }
           "COLLATION_MODE=$mode" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "::notice title=initdb mode::$mode"
           $ErrorActionPreference = 'Stop'
@@ -310,8 +303,8 @@ jobs:
         run: |
           $tests = '${{ steps.regress.outcome }}'
           $tag = "postgres-$($env:PG_VERSION)-windows-arm64-run$($env:GITHUB_RUN_NUMBER)"
-          $title = "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER), regression tests: $tests, collation: $($env:COLLATION_MODE))"
-          $notes = "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified) with the upstream commit a516b3f00d74 (MSVC AArch64 support) applied. Regression tests: $tests. initdb collation that worked in the CI test: $($env:COLLATION_MODE). SHA-256: $($env:ZIP_SHA)"
+          $title = "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER), regression tests: $tests, initdb: $($env:COLLATION_MODE))"
+          $notes = "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified) with the upstream commit a516b3f00d74 (MSVC AArch64 support) applied. Regression tests: $tests. initdb mode that worked in the CI test (ICU is disabled in this build): $($env:COLLATION_MODE). SHA-256: $($env:ZIP_SHA)"
           gh release create $tag $env:ZIP_NAME "$($env:ZIP_NAME).sha256" --title $title --notes $notes
 
       - name: What went wrong (shown as annotations)
