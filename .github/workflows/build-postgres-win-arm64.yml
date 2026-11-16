@@ -44,6 +44,23 @@ jobs:
           Rename-Item "postgresql-$v" pgsrc
           "unpacked: " + (Test-Path pgsrc\meson.build)
 
+      - name: Apply the upstream ARM64 patch (PostgreSQL commit a516b3f00d74, MSVC AArch64 support)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest 'https://github.com/postgres/postgres/commit/a516b3f00d74.patch' -OutFile arm64.patch
+          $expected = '86a32db99e237e419047664ec6093045e4c2fe1182223a71c42a9a33d4db161c'
+          $actual = (Get-FileHash arm64.patch -Algorithm SHA256).Hash.ToLower()
+          "expected $expected"
+          "actual   $actual"
+          if ($expected -ne $actual) { throw "the upstream patch is not the one we reviewed" }
+          Set-Location pgsrc
+          git apply --check --exclude='doc/*' --whitespace=nowarn ..\arm64.patch
+          if ($LASTEXITCODE -ne 0) { throw "the patch does not apply to this PostgreSQL version" }
+          git apply --exclude='doc/*' --whitespace=nowarn --verbose ..\arm64.patch
+          if ($LASTEXITCODE -ne 0) { throw "applying the patch failed" }
+          Select-String -Path src\tools\msvc_gendef.pl -Pattern 'aarch64' | ForEach-Object { $_.Line.Trim() }
+          Select-String -Path src\include\storage\s_lock.h -Pattern '_InterlockedExchange|__isb' | ForEach-Object { $_.Line.Trim() }
+
       - name: Compiler environment (ARM64)
         run: |
           $ErrorActionPreference = 'Stop'
@@ -190,6 +207,19 @@ jobs:
           & "$pg\bin\pg_ctl.exe" stop -D C:\pgdata -m fast -w
           "smoke test passed"
 
+      - name: PostgreSQL's own regression tests (informational, never blocks the zip)
+        id: regress
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          $inst = "$env:VCPKG_DIR\installed\arm64-windows"
+          $env:PKG_CONFIG_PATH = "$inst\lib\pkgconfig"
+          $env:PATH = "C:\ProgramData\chocolatey\bin;C:\Strawberry\perl\bin;$inst\bin;$env:PATH"
+          Set-Location pgsrc
+          meson test -C build --suite setup --suite regress --print-errorlogs --no-suite tap
+          "regression tests exit code: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { throw "regression tests failed" }
+
       - name: Package and checksum
         run: |
           $ErrorActionPreference = 'Stop'
@@ -214,8 +244,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $tests = '${{ steps.regress.outcome }}'
           $tag = "postgres-$($env:PG_VERSION)-windows-arm64-run$($env:GITHUB_RUN_NUMBER)"
-          gh release create $tag $env:ZIP_NAME "$($env:ZIP_NAME).sha256" --title "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER))" --notes "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified). SHA-256: $($env:ZIP_SHA)"
+          $title = "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER), regression tests: $tests)"
+          $notes = "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified) with the upstream commit a516b3f00d74 (MSVC AArch64 support) applied. Regression tests: $tests. SHA-256: $($env:ZIP_SHA)"
+          gh release create $tag $env:ZIP_NAME "$($env:ZIP_NAME).sha256" --title $title --notes $notes
 
       - name: What went wrong (shown as annotations)
         if: failure()
