@@ -214,13 +214,53 @@ jobs:
 
       - name: Test it starts and accepts a login
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $pg = $env:PG_PREFIX
           & "$pg\bin\postgres.exe" -V
           $pw = 'smoke-test-password-0123456789'
           Set-Content pw.txt $pw -NoNewline -Encoding ascii
-          & "$pg\bin\initdb.exe" -D C:\pgdata -U ontocode -E UTF8 --locale=C --locale-provider=icu --icu-locale=en-US --auth-local=scram-sha-256 --auth-host=scram-sha-256 --pwfile=pw.txt --no-sync
-          if ($LASTEXITCODE -ne 0) { throw "initdb failed" }
+
+          "--- ICU files next to the programs ---"
+          Get-ChildItem "$pg\bin" -Filter 'icu*.dll' | ForEach-Object { "{0}  {1:N0} bytes" -f $_.Name, $_.Length }
+
+          "--- DLLs our programs import that are missing ---"
+          $present = @{}; Get-ChildItem "$pg\bin" -Filter *.dll | ForEach-Object { $present[$_.Name.ToLower()] = $true }
+          $sys = "$env:windir\System32"
+          $missing = @{}
+          Get-ChildItem "$pg\bin" -Include *.exe,*.dll -Recurse | ForEach-Object {
+            $who = $_.Name
+            foreach ($line in (& dumpbin /nologo /dependents $_.FullName 2>$null)) {
+              if ($line -match '^\s+([A-Za-z0-9_\-\.]+\.dll)\s*$') {
+                $n = $Matches[1].ToLower()
+                if ($n -like 'api-ms-*' -or $present.ContainsKey($n) -or (Test-Path "$sys\$n")) { continue }
+                $missing["$n  (needed by $who)"] = $true
+              }
+            }
+          }
+          if ($missing.Count) { $missing.Keys | Sort-Object } else { "none missing" }
+
+          function Invoke-Initdb($label, $dir, [string[]]$extra) {
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item initdb-out.txt, initdb-err.txt -Force -ErrorAction SilentlyContinue
+            $base = @('-D', $dir, '-U', 'ontocode', '-E', 'UTF8', '--auth-local=scram-sha-256', '--auth-host=scram-sha-256', '--pwfile=pw.txt', '--no-sync')
+            $p = Start-Process -FilePath "$pg\bin\initdb.exe" -ArgumentList ($base + $extra) -NoNewWindow -Wait -PassThru -RedirectStandardOutput initdb-out.txt -RedirectStandardError initdb-err.txt
+            $code = $p.ExitCode
+            "[$label] initdb exit code: $code (0x{0:x})" -f ([uint32]$code)
+            "[$label] stdout:"; Get-Content initdb-out.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+            "[$label] stderr:"; Get-Content initdb-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+            return ($code -eq 0)
+          }
+
+          $mode = $null
+          if (Invoke-Initdb 'ICU en-US' 'C:\pgdata' @('--locale=C', '--locale-provider=icu', '--icu-locale=en-US')) { $mode = 'ICU en-US' }
+          else {
+            "ICU failed, trying the same fallback as the desktop app (plain C collation)"
+            if (Invoke-Initdb 'plain C' 'C:\pgdata' @('--locale=C')) { $mode = 'plain C (fallback)' }
+          }
+          if (-not $mode) { throw "initdb failed in both modes" }
+          "COLLATION_MODE=$mode" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "::notice title=initdb mode::$mode"
+          $ErrorActionPreference = 'Stop'
           & "$pg\bin\pg_ctl.exe" start -D C:\pgdata -l C:\pg.log -w -o "-p 54329 -c listen_addresses=127.0.0.1"
           if ($LASTEXITCODE -ne 0) { Get-Content C:\pg.log; throw "server did not start" }
           $env:PGPASSWORD = $pw
@@ -270,8 +310,8 @@ jobs:
         run: |
           $tests = '${{ steps.regress.outcome }}'
           $tag = "postgres-$($env:PG_VERSION)-windows-arm64-run$($env:GITHUB_RUN_NUMBER)"
-          $title = "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER), regression tests: $tests)"
-          $notes = "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified) with the upstream commit a516b3f00d74 (MSVC AArch64 support) applied. Regression tests: $tests. SHA-256: $($env:ZIP_SHA)"
+          $title = "PostgreSQL $($env:PG_VERSION) for Windows ARM64 (run $($env:GITHUB_RUN_NUMBER), regression tests: $tests, collation: $($env:COLLATION_MODE))"
+          $notes = "Built from the official PostgreSQL $($env:PG_VERSION) source (checksum verified) with the upstream commit a516b3f00d74 (MSVC AArch64 support) applied. Regression tests: $tests. initdb collation that worked in the CI test: $($env:COLLATION_MODE). SHA-256: $($env:ZIP_SHA)"
           gh release create $tag $env:ZIP_NAME "$($env:ZIP_NAME).sha256" --title $title --notes $notes
 
       - name: What went wrong (shown as annotations)
