@@ -245,10 +245,10 @@ jobs:
             $base = @('-D', $dir, '-U', 'ontocode', '-E', 'UTF8', '--auth-local=scram-sha-256', '--auth-host=scram-sha-256', '--pwfile=pw.txt', '--no-sync')
             $p = Start-Process -FilePath "$pg\bin\initdb.exe" -ArgumentList ($base + $extra) -NoNewWindow -Wait -PassThru -RedirectStandardOutput initdb-out.txt -RedirectStandardError initdb-err.txt
             $code = $p.ExitCode
-            "[$label] initdb exit code: $code (0x{0:x})" -f ([uint32]$code)
-            "[$label] stdout:"; Get-Content initdb-out.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
-            "[$label] stderr:"; Get-Content initdb-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
-            return ($code -eq 0)
+            Write-Host ("[$label] initdb exit code: $code (0x{0:x})" -f ([uint32]$code))
+            Write-Host "[$label] stdout:"; Get-Content initdb-out.txt -ErrorAction SilentlyContinue | Select-Object -Last 40 | Out-Host
+            Write-Host "[$label] stderr:"; Get-Content initdb-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 40 | Out-Host
+            return [bool]($code -eq 0)
           }
 
           $mode = $null
