@@ -67,11 +67,22 @@ jobs:
             [System.Net.ServicePointManager]::SecurityProtocol = 3072
             iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           }
-          choco install winflexbison3 strawberryperl -y --no-progress
+          choco install winflexbison3 strawberryperl pkgconfiglite -y --no-progress
           "C:\Strawberry\perl\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
           "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $env:PATH = "C:\Strawberry\perl\bin;C:\ProgramData\chocolatey\bin;$env:PATH"
+          foreach ($t in 'pkg-config','perl','win_bison','win_flex','meson','ninja') { $c = Get-Command $t -ErrorAction SilentlyContinue; "{0,-10} {1}" -f $t, $(if ($c) { $c.Source } else { 'NOT FOUND' }) }
+          pkg-config --version
+
+      - name: Restore compiled libraries from the cache
+        id: libcache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-installed-arm64-zlib-lz4-zstd-icu-v1
 
       - name: Libraries for ARM64 (zlib, lz4, zstd, ICU)
+        id: libs
         run: |
           $ErrorActionPreference = 'Stop'
           $vcpkg = $env:VCPKG_INSTALLATION_ROOT
@@ -87,12 +98,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "vcpkg failed with exit code $LASTEXITCODE" }
           Get-ChildItem "$vcpkg\installed\arm64-windows\bin" -Filter *.dll | Select-Object -ExpandProperty Name
 
+      - name: Save the compiled libraries to the cache
+        if: always() && steps.libs.conclusion == 'success' && steps.libcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-installed-arm64-zlib-lz4-zstd-icu-v1
+
       - name: Configure and compile PostgreSQL
         run: |
           $ErrorActionPreference = 'Stop'
           $inst = "$env:VCPKG_DIR\installed\arm64-windows"
           $env:PKG_CONFIG_PATH = "$inst\lib\pkgconfig"
-          $env:PATH = "$inst\bin;$env:PATH"
+          $env:PATH = "C:\Strawberry\perl\bin;C:\ProgramData\chocolatey\bin;$inst\bin;$env:PATH"
+          "pkg-config search folder: $env:PKG_CONFIG_PATH"
+          Get-ChildItem $env:PKG_CONFIG_PATH -Filter *.pc | Select-Object -ExpandProperty Name
+          foreach ($m in 'icu-uc','icu-i18n','zlib','liblz4','libzstd') { pkg-config --modversion $m; if ($LASTEXITCODE -ne 0) { "pkg-config cannot find $m" } }
           Set-Location pgsrc
           meson setup build --buildtype=release "--prefix=$env:PG_PREFIX" `
             -Dicu=enabled -Dzlib=enabled -Dlz4=enabled -Dzstd=enabled -Dssl=none -Dnls=disabled `
