@@ -70,9 +70,11 @@ jobs:
           choco install winflexbison3 strawberryperl pkgconfiglite -y --no-progress
           "C:\Strawberry\perl\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
           "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          $env:PATH = "C:\Strawberry\perl\bin;C:\ProgramData\chocolatey\bin;$env:PATH"
-          foreach ($t in 'pkg-config','perl','win_bison','win_flex','meson','ninja') { $c = Get-Command $t -ErrorAction SilentlyContinue; "{0,-10} {1}" -f $t, $(if ($c) { $c.Source } else { 'NOT FOUND' }) }
-          pkg-config --version
+          if (Test-Path 'C:\Strawberry\perl\bin\pkg-config.bat') { Rename-Item 'C:\Strawberry\perl\bin\pkg-config.bat' 'pkg-config.bat.disabled' }
+          $env:PATH = "C:\ProgramData\chocolatey\bin;C:\Strawberry\perl\bin;$env:PATH"
+          foreach ($t in 'pkg-config','perl','win_bison','win_flex','meson','ninja') { $c = Get-Command $t -All -ErrorAction SilentlyContinue; "{0,-10} {1}" -f $t, $(if ($c) { ($c | ForEach-Object Source) -join '  |  ' } else { 'NOT FOUND' }) }
+          if (-not (Test-Path 'C:\ProgramData\chocolatey\bin\pkg-config.exe')) { throw "the real pkg-config.exe is missing" }
+          & 'C:\ProgramData\chocolatey\bin\pkg-config.exe' --version
 
       - name: Restore compiled libraries from the cache
         id: libcache
@@ -110,7 +112,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $inst = "$env:VCPKG_DIR\installed\arm64-windows"
           $env:PKG_CONFIG_PATH = "$inst\lib\pkgconfig"
-          $env:PATH = "C:\Strawberry\perl\bin;C:\ProgramData\chocolatey\bin;$inst\bin;$env:PATH"
+          $env:PKG_CONFIG = 'C:\ProgramData\chocolatey\bin\pkg-config.exe'
+          if (Test-Path 'C:\Strawberry\perl\bin\pkg-config.bat') { Rename-Item 'C:\Strawberry\perl\bin\pkg-config.bat' 'pkg-config.bat.disabled' }
+          $env:PATH = "C:\ProgramData\chocolatey\bin;C:\Strawberry\perl\bin;$inst\bin;$env:PATH"
+          "pkg-config used by meson: $env:PKG_CONFIG"
           "pkg-config search folder: $env:PKG_CONFIG_PATH"
           Get-ChildItem $env:PKG_CONFIG_PATH -Filter *.pc | Select-Object -ExpandProperty Name
           foreach ($m in 'icu-uc','icu-i18n','zlib','liblz4','libzstd') { pkg-config --modversion $m; if ($LASTEXITCODE -ne 0) { "pkg-config cannot find $m" } }
