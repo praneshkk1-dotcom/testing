@@ -254,8 +254,10 @@ jobs:
           "COLLATION_MODE=$mode" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "::notice title=initdb mode::$mode"
           $ErrorActionPreference = 'Stop'
-          & "$pg\bin\pg_ctl.exe" start -D C:\pgdata -l C:\pg.log -w -o "-p 54329 -c listen_addresses=127.0.0.1"
-          if ($LASTEXITCODE -ne 0) { Get-Content C:\pg.log; throw "server did not start" }
+          $log = Join-Path $env:TEMP 'pg.log'
+          "server log file: $log"
+          & "$pg\bin\pg_ctl.exe" start -D C:\pgdata -l $log -w -o "-p 54329 -c listen_addresses=127.0.0.1"
+          if ($LASTEXITCODE -ne 0) { if (Test-Path $log) { Get-Content $log } else { "no server log was written" }; throw "server did not start" }
           $env:PGPASSWORD = $pw
           & "$pg\bin\psql.exe" -h 127.0.0.1 -p 54329 -U ontocode -d postgres -Atc "select version()"
           & "$pg\bin\psql.exe" -h 127.0.0.1 -p 54329 -U ontocode -d postgres -Atc "create database ontocode owner ontocode"
@@ -318,6 +320,6 @@ jobs:
             }
           }
           Show 'meson-log' 'pgsrc\build\meson-logs\meson-log.txt' 60
-          Show 'postgres-server-log' 'C:\pg.log' 40
+          Show 'postgres-server-log' (Join-Path $env:TEMP 'pg.log') 40
           $vlogs = Get-ChildItem "$env:VCPKG_DIR\buildtrees" -Recurse -Filter '*-err.log' -ErrorAction SilentlyContinue | Select-Object -First 2
           foreach ($l in $vlogs) { Show ("vcpkg " + $l.Name) $l.FullName 40 }
