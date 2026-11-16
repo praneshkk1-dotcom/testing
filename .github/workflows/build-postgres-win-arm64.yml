@@ -156,7 +156,29 @@ jobs:
           $crt = Get-ChildItem "$env:VS_ROOT\VC\Redist\MSVC" -Recurse -Directory -Filter 'Microsoft.VC*.CRT' |
             Where-Object { $_.FullName -match '\\arm64\\' -and $_.FullName -notmatch 'onecore|debug' } | Select-Object -First 1
           "CRT folder: $($crt.FullName)"
-          Copy-Item "$($crt.FullName)\*.dll" "$pg\bin" -Force
+          "files in it: " + ((Get-ChildItem $crt.FullName -Filter *.dll | ForEach-Object Name) -join ', ')
+          "dumpbin: " + (Get-Command dumpbin -ErrorAction Stop).Source
+          function Get-Imports($folders) {
+            $set = @{}
+            Get-ChildItem $folders -Recurse -Include *.exe,*.dll | ForEach-Object {
+              foreach ($line in (& dumpbin /nologo /dependents $_.FullName 2>$null)) {
+                if ($line -match '^\s+([A-Za-z0-9_\-\.]+\.dll)\s*$') { $set[$Matches[1].ToLower()] = $true }
+              }
+            }
+            return $set
+          }
+          for ($pass = 1; $pass -le 3; $pass++) {
+            $imports = Get-Imports @("$pg\bin", "$pg\lib")
+            $added = 0
+            foreach ($d in (Get-ChildItem $crt.FullName -Filter *.dll)) {
+              if ($imports.ContainsKey($d.Name.ToLower()) -and -not (Test-Path "$pg\bin\$($d.Name)")) {
+                Copy-Item $d.FullName "$pg\bin" -Force; "pass ${pass}: copied $($d.Name)"; $added++
+              }
+            }
+            if ($added -eq 0) { break }
+          }
+          "DLLs imported by our programs: " + (($imports.Keys | Sort-Object) -join ', ')
+          "imported by postgres.exe: " + ((& dumpbin /nologo /dependents "$pg\bin\postgres.exe" | Where-Object { $_ -match '\.dll' } | ForEach-Object { $_.Trim() }) -join ', ')
           Remove-Item "$pg\include" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$pg\doc" -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory "$pg\licenses" -Force | Out-Null
@@ -165,6 +187,8 @@ jobs:
           Get-ChildItem $pg -Directory | Select-Object -ExpandProperty Name
 
       - name: Check that every program is ARM64
+        id: archcheck
+        continue-on-error: true
         run: |
           $ErrorActionPreference = 'Stop'
           function Get-Machine($file) {
@@ -240,7 +264,7 @@ jobs:
             postgres-*-windows-arm64.zip.sha256
 
       - name: Publish as a release file
-        if: github.ref == 'refs/heads/arm64-postgres'
+        if: github.ref == 'refs/heads/arm64-postgres' && steps.archcheck.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
