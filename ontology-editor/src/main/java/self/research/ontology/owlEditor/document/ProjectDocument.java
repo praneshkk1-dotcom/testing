@@ -1,0 +1,155 @@
+package self.research.ontology.owlEditor.document;
+
+import java.time.Instant;
+import java.util.Map;
+
+public class ProjectDocument {
+
+    private String id;
+    private String name;
+    private String filename;
+    private String ownerEmail;
+    private String ownerId;
+    private String projectId;
+    private String workspaceId;
+    private String gridfsFileId;
+    private String status;
+    private String statusMessage;
+    private Instant createdAt;
+    private Instant updatedAt;
+    private Map<String, Object> metadata;
+    private Long mutationVersion;
+    private Long mainGraphRevision;
+
+    public boolean isOwnedBy(String userId, String email) {
+        if (userId != null && !userId.isBlank() && userId.equals(ownerId)) return true;
+        return email != null && !email.isBlank() && email.equalsIgnoreCase(ownerEmail);
+    }
+
+    public ProjectDocument() {
+    }
+    
+    public ProjectDocument(String id, String name, String filename) {
+        this.id = id;
+        this.name = name;
+        this.filename = filename;
+        this.createdAt = Instant.now();
+        this.updatedAt = Instant.now();
+        this.status = "UPLOADED";
+    }
+    
+    public String getId() {
+        return id;
+    }
+    
+    public void setId(String id) {
+        this.id = id;
+    }
+    
+    public String getName() {
+        return name;
+    }
+    
+    public void setName(String name) {
+        this.name = name;
+    }
+    
+    public String getFilename() {
+        return filename;
+    }
+    
+    public void setFilename(String filename) {
+        this.filename = filename;
+    }
+    
+    public String getOwnerId() { return ownerId; }
+    public void setOwnerId(String ownerId) { this.ownerId = ownerId; }
+
+    public String getOwnerEmail() {
+        return ownerEmail;
+    }
+    
+    public void setOwnerEmail(String ownerEmail) {
+        this.ownerEmail = ownerEmail;
+    }
+    
+    public String getProjectId() {
+        return projectId;
+    }
+    
+    public void setProjectId(String projectId) {
+        this.projectId = projectId;
+    }
+    
+    public String getWorkspaceId() {
+        return workspaceId;
+    }
+    
+    public void setWorkspaceId(String workspaceId) {
+        this.workspaceId = workspaceId;
+    }
+    
+    public String getGridfsFileId() {
+        return gridfsFileId;
+    }
+    
+    public void setGridfsFileId(String gridfsFileId) {
+        this.gridfsFileId = gridfsFileId;
+    }
+    
+    public String getStatus() {
+        return status;
+    }
+    
+    public void setStatus(String status) {
+        this.status = status;
+    }
+    
+    public String getStatusMessage() {
+        return statusMessage;
+    }
+    
+    public void setStatusMessage(String statusMessage) {
+        this.statusMessage = statusMessage;
+    }
+    
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+    
+    public void setCreatedAt(Instant createdAt) {
+        this.createdAt = createdAt;
+    }
+    
+    public Instant getUpdatedAt() {
+        return updatedAt;
+    }
+    
+    public void setUpdatedAt(Instant updatedAt) {
+        this.updatedAt = updatedAt;
+    }
+    
+    public Map<String, Object> getMetadata() {
+        return metadata;
+    }
+    
+    public void setMetadata(Map<String, Object> metadata) {
+        this.metadata = metadata;
+    }
+
+    public Long getMutationVersion() {
+        return mutationVersion;
+    }
+
+    public void setMutationVersion(Long mutationVersion) {
+        this.mutationVersion = mutationVersion;
+    }
+
+    public Long getMainGraphRevision() {
+        return mainGraphRevision;
+    }
+
+    public void setMainGraphRevision(Long mainGraphRevision) {
+        this.mainGraphRevision = mainGraphRevision;
+    }
+}

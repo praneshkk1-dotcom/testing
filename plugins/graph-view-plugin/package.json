@@ -1,0 +1,71 @@
+{
+  "name": "@ontocode/graph-view-plugin",
+  "displayName": "Advanced Ontology Graph View",
+  "version": "3.1.0",
+  "description": "Next-generation D3.js-powered graph visualization with hierarchical lazy loading: Shows root nodes first, expand on demand, smart search with path visualization, 60 FPS performance with 100,000+ nodes",
+  "author": "OntoCode Team",
+  "license": "MIT",
+  "icon": "icon.png",
+  "main": "./dist/index.js",
+  "category": "Visualization",
+  "keywords": [
+    "ontology",
+    "graph",
+    "visualization",
+    "network",
+    "diagram",
+    "owl",
+    "rdf",
+    "knowledge graph",
+    "semantic web",
+    "reasoning",
+    "inference",
+    "provenance",
+    "temporal",
+    "spatial",
+    "ml",
+    "ai",
+    "collaboration",
+    "sparql",
+    "cypher",
+    "graph-rag"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/The-Self-Research-Institute/ontocode",
+    "directory": "plugins/graph-view-plugin"
+  },
+  "homepage": "https://github.com/The-Self-Research-Institute/ontocode/tree/main/plugins/graph-view-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/The-Self-Research-Institute/ontocode/issues"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "scripts": {
+    "build": "webpack --mode production",
+    "watch": "webpack --mode development --watch"
+  },
+  "dependencies": {
+    "@types/d3": "^7.4.3",
+    "d3": "^7.9.0",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "graphology-layout-noverlap": "^0.4.2",
+    "graphology-types": "^0.24.8",
+    "lucide-react": "^1.72.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sigma": "^4.0.6",
+    "vis-network": "^10.1.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "ts-loader": "^9.4.0",
+    "typescript": "~6.0.0",
+    "webpack": "^5.88.0",
+    "webpack-cli": "^7.3.1"
+  }
+}

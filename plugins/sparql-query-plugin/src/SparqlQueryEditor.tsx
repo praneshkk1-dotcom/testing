@@ -1,0 +1,1249 @@
+
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Plus, Trash2, Play, Save, Loader2, ChevronDown, ChevronRight, Download, Database, Code, Table, FileText, RefreshCw, Copy, Check } from 'lucide-react';
+import type { SparqlQuery, SparqlQueryResult, OntologyPrefix, PluginContext, SparqlQueryEditorProps, GraphQueryResult, GraphFormat } from './types';
+import { detectQueryForm, isGraphForm, UPDATE_HINT } from './queryForm';
+import { formatTerm, normalizeRows, XSD_NS } from './bindingFormat';
+import type { PrefixEntry, TermRow } from './bindingFormat';
+import {
+  DEFAULT_PAGE_SIZE, EXPIRED_MESSAGE, FILTER_DEBOUNCE_MS, PAGE_SIZES, clampPage, exportNote, filterRows, formatNumber,
+  localPage, nextSort, pageCount, pageKey, resultsLine, resultsMeta, rowsPath, showingText, sortArrow, sortRows,
+  truncationNotice
+} from './resultsPaging';
+import { MIN_RESULTS_HEIGHT, nextResultsHeight } from './resultsHeight';
+import type { ResultsMeta, ResultsSort } from './resultsPaging';
+import { buildExportTable, toCsv, toTsv, buildJsonBindings } from './exportColumns';
+import {
+  COMPUTING_TEXT, INCLUDED_ITEMS, NOT_INCLUDED_ITEMS, buildRequestBody, canRefresh, countsText, effectiveMode, infoLine,
+  loadMode, mapConflict, needsCompute, partialMessages, saveMode, statusUrl, switchState, usedInferred
+} from './inferredState';
+import type { ConflictKind, InferenceMode, InferenceStatus, InferredInfo } from './inferredState';
+const RESULTS_AREA_RESERVED = 40;
+
+const GRAPH_FORMATS: { value: GraphFormat; label: string; ext: string; mime: string }[] = [
+  { value: 'turtle', label: 'Turtle', ext: 'ttl', mime: 'text/turtle' },
+  { value: 'jsonld', label: 'JSON-LD', ext: 'jsonld', mime: 'application/ld+json' },
+  { value: 'rdfxml', label: 'RDF/XML', ext: 'rdf', mime: 'application/rdf+xml' },
+  { value: 'ntriples', label: 'N-Triples', ext: 'nt', mime: 'application/n-triples' }
+];
+
+const SPARQL_KEYWORDS = [
+  'SELECT', 'CONSTRUCT', 'DESCRIBE', 'ASK', 'WHERE', 'FROM', 'NAMED',
+  'PREFIX', 'BASE', 'OPTIONAL', 'UNION', 'FILTER', 'GRAPH', 'ORDER', 'BY',
+  'LIMIT', 'OFFSET', 'DISTINCT', 'REDUCED', 'GROUP', 'HAVING', 'VALUES',
+  'BIND', 'AS', 'SERVICE', 'MINUS', 'EXISTS', 'NOT', 'IN', 'INSERT', 'DELETE',
+  'DATA', 'LOAD', 'CLEAR', 'CREATE', 'DROP', 'COPY', 'MOVE', 'ADD'
+];
+
+const COMMON_PREFIXES = `PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+`;
+
+const SAMPLE_QUERIES = [
+  {
+    name: 'Construct Subclass Triples',
+    query: `${COMMON_PREFIXES}CONSTRUCT { ?sub rdfs:subClassOf ?super } WHERE {
+  ?sub rdfs:subClassOf ?super .
+  FILTER(isIRI(?super))
+}
+LIMIT 100`
+  },
+  {
+    name: 'Ask If Any Class Exists',
+    query: `${COMMON_PREFIXES}ASK { ?class a owl:Class }`
+  },
+  {
+    name: 'List All Classes',
+    query: `${COMMON_PREFIXES}SELECT DISTINCT ?class ?label WHERE {
+  ?class a owl:Class .
+  OPTIONAL { ?class rdfs:label ?label }
+}
+ORDER BY ?label
+LIMIT 100`
+  },
+  {
+    name: 'List All Properties',
+    query: `${COMMON_PREFIXES}SELECT DISTINCT ?property ?type ?label WHERE {
+  { ?property a owl:ObjectProperty } UNION
+  { ?property a owl:DatatypeProperty } UNION
+  { ?property a owl:AnnotationProperty }
+  BIND(IF(EXISTS { ?property a owl:ObjectProperty }, "Object",
+       IF(EXISTS { ?property a owl:DatatypeProperty }, "Data", "Annotation")) AS ?type)
+  OPTIONAL { ?property rdfs:label ?label }
+}
+ORDER BY ?type ?label
+LIMIT 100`
+  },
+  {
+    name: 'List All Individuals',
+    query: `${COMMON_PREFIXES}SELECT DISTINCT ?individual ?type ?label WHERE {
+  ?individual a ?type .
+  ?type a owl:Class .
+  FILTER(?type != owl:Class && ?type != owl:NamedIndividual)
+  OPTIONAL { ?individual rdfs:label ?label }
+}
+ORDER BY ?type ?label
+LIMIT 100`
+  },
+  {
+    name: 'Count Triples',
+    query: `SELECT (COUNT(*) AS ?count) WHERE {
+  ?s ?p ?o
+}`
+  },
+  {
+    name: 'SubClass Hierarchy',
+    query: `${COMMON_PREFIXES}SELECT ?subclass ?superclass ?subLabel ?superLabel WHERE {
+  ?subclass rdfs:subClassOf ?superclass .
+  FILTER(isIRI(?superclass))
+  OPTIONAL { ?subclass rdfs:label ?subLabel }
+  OPTIONAL { ?superclass rdfs:label ?superLabel }
+}
+ORDER BY ?superclass ?subclass
+LIMIT 100`
+  }
+];
+
+export const SparqlQueryEditor: React.FC<SparqlQueryEditorProps> = ({ 
+  projectId, 
+  prefixes = [],
+  context,
+  draftMode = false
+}) => {
+  const { apiClient } = context;
+  const mainAreaRef = useRef<HTMLDivElement>(null);
+  
+  const [queries, setQueries] = useState<SparqlQuery[]>([]);
+  const [selectedQuery, setSelectedQuery] = useState<SparqlQuery | null>(null);
+  const [queryText, setQueryText] = useState('SELECT ?s ?p ?o WHERE {\n  ?s ?p ?o\n} LIMIT 10');
+  const [queryName, setQueryName] = useState('New Query');
+  const [results, setResults] = useState<SparqlQueryResult | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [computing, setComputing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isPrefixesVisible, setPrefixesVisible] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState<'table' | 'json'>('table');
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [resultsHeight, setResultsHeight] = useState<number | null>(null);
+  const resultsAreaRef = useRef<HTMLDivElement>(null);
+  const resultsPanelRef = useRef<HTMLDivElement>(null);
+  const [isResizing, setIsResizing] = useState(false);
+  const [activeTab, setActiveTab] = useState<'editor' | 'results'>('editor');
+  const [selectedSample, setSelectedSample] = useState('');
+  const [graphResult, setGraphResult] = useState<GraphQueryResult | null>(null);
+  const [booleanResult, setBooleanResult] = useState<{ value: boolean; executionTime?: number } | null>(null);
+  const [graphFormat, setGraphFormat] = useState<GraphFormat>('turtle');
+  const [includeTypes, setIncludeTypes] = useState(false);
+  const [mode, setMode] = useState<InferenceMode>(() => loadMode(projectId));
+  const [status, setStatus] = useState<InferenceStatus | null>(null);
+  const [inferredInfo, setInferredInfo] = useState<InferredInfo | null>(null);
+  const [conflict, setConflict] = useState<ConflictKind | null>(null);
+  const [showIncluded, setShowIncluded] = useState(false);
+
+  const [meta, setMeta] = useState<ResultsMeta | null>(null);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [page, setPage] = useState(0);
+  const [filterInput, setFilterInput] = useState('');
+  const [filterTerm, setFilterTerm] = useState('');
+  const [sort, setSort] = useState<ResultsSort | null>(null);
+  const [serverPage, setServerPage] = useState<{ key: string; rows: TermRow[]; filtered: number } | null>(null);
+  const [pageNote, setPageNote] = useState('');
+  const [expired, setExpired] = useState(false);
+  const fetchSeq = useRef(0);
+
+  const resetPaging = () => {
+    setMeta(null);
+    setServerPage(null);
+    setPageNote('');
+    setExpired(false);
+    setFilterInput('');
+    setFilterTerm('');
+    setPage(0);
+    setSort(null);
+  };
+
+  const clearResults = () => {
+    setResults(null);
+    setGraphResult(null);
+    setBooleanResult(null);
+    setInferredInfo(null);
+    resetPaging();
+  };
+
+  useEffect(() => {
+    if (filterInput === filterTerm) return;
+    const timer = setTimeout(() => {
+      setFilterTerm(filterInput);
+      setPage(0);
+    }, FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [filterInput, filterTerm]);
+
+  const runId = meta?.runId ?? null;
+  const columns = results?.head.vars ?? [];
+  const wantedKey = runId ? pageKey(runId, filterTerm, sort, page, pageSize) : '';
+
+  useEffect(() => {
+    if (!runId || !wantedKey || serverPage?.key === wantedKey) return;
+    const seq = ++fetchSeq.current;
+    apiClient
+      .get<any>(rowsPath(projectId, runId, { offset: page * pageSize, limit: pageSize, filter: filterTerm, sort }))
+      .then((res) => {
+        if (seq !== fetchSeq.current) return;
+        const rows = normalizeRows(res);
+        setPageNote('');
+        setServerPage({ key: wantedKey, rows, filtered: typeof res?.filteredRows === 'number' ? res.filteredRows : rows.length });
+      })
+      .catch((e: any) => {
+        if (seq !== fetchSeq.current) return;
+        if (e?.status === 410) {
+          setExpired(true);
+        } else {
+          setPageNote(e?.data?.message || e?.message || 'Could not load this page. Try again.');
+        }
+      });
+  }, [runId, wantedKey, serverPage, projectId, page, pageSize, filterTerm, sort, apiClient]);
+
+  const local = useMemo(
+    () => (runId || !results ? null : localPage(results.results.bindings, columns, filterTerm, sort, page, pageSize)),
+    [runId, results, columns, filterTerm, sort, page, pageSize]
+  );
+  const filteredCount = runId ? (serverPage?.filtered ?? 0) : (local?.filtered ?? 0);
+  const pageRows: TermRow[] = runId ? (serverPage?.rows ?? []) : (local?.rows ?? []);
+  const safePage = clampPage(page, filteredCount, pageSize);
+  const lastPage = pageCount(filteredCount, pageSize) - 1;
+  const pageLoading = !!runId && !expired && serverPage?.key !== wantedKey;
+  const notice = meta ? truncationNotice(meta) : null;
+  const jsonText = useMemo(
+    () => (activeResultTab === 'json' && results ? JSON.stringify({ ...results, results: { bindings: pageRows } }, null, 2) : ''),
+    [activeResultTab, results, pageRows]
+  );
+
+  useEffect(() => {
+    setMode(loadMode(projectId));
+  }, [projectId]);
+
+  const refreshStatus = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const next = await apiClient.get<InferenceStatus>(statusUrl(projectId, draftMode));
+      setStatus(next && typeof next === 'object' && !Array.isArray(next) ? next : null);
+    } catch {
+      setStatus(null);
+    }
+  }, [projectId, draftMode, apiClient]);
+
+  useEffect(() => {
+    refreshStatus();
+  }, [refreshStatus]);
+
+  const switchInfo = switchState(status);
+  const activeMode = effectiveMode(mode, status);
+
+  const chooseMode = (next: InferenceMode) => {
+    setMode(next);
+    saveMode(projectId, next);
+  };
+
+  const queryForm = detectQueryForm(queryText);
+  const isUpdate = queryForm === 'update';
+  const hasOutcome = !!(results || graphResult || booleanResult);
+  const shortPrefixes: PrefixEntry[] = [
+    ...prefixes.map(p => ({ prefix: p.prefix, namespace: p.namespace })),
+    { prefix: 'xsd', namespace: XSD_NS }
+  ];
+
+  const fetchQueries = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const response = await apiClient.get<SparqlQuery[]>(`/api/sparql/${projectId}/queries`);
+      setQueries(response || []);
+    } catch (error) {
+      console.error('Failed to fetch SPARQL queries:', error);
+    }
+  }, [projectId, apiClient]);
+
+  useEffect(() => {
+    fetchQueries();
+  }, [fetchQueries]);
+
+  const handleSelectQuery = (query: SparqlQuery) => {
+    setSelectedQuery(query);
+    setQueryText(query.queryText);
+    setQueryName(query.name);
+    clearResults();
+    setError(null);
+    setActiveTab('editor');
+  };
+
+  const handleNewQuery = () => {
+    setSelectedQuery(null);
+    setQueryText('SELECT ?s ?p ?o WHERE {\n  ?s ?p ?o\n} LIMIT 10');
+    setQueryName('New Query');
+    clearResults();
+    setError(null);
+    setActiveTab('editor');
+  };
+
+  const handleLoadSample = (sample: typeof SAMPLE_QUERIES[0]) => {
+    setSelectedQuery(null);
+    setQueryText(sample.query);
+    setQueryName(sample.name);
+    clearResults();
+    setError(null);
+    setActiveTab('editor');
+    setTimeout(() => setSelectedSample(''), 300);
+  };
+
+  const handleSaveQuery = async () => {
+    if (!queryName.trim()) {
+      setError('Please enter a query name');
+      return;
+    }
+    
+    setIsSaving(true);
+    setError(null);
+    
+    try {
+      const queryData = { name: queryName, queryText };
+      
+      if (selectedQuery) {
+        const updatedQuery = await apiClient.put<SparqlQuery>(
+          `/api/sparql/${projectId}/queries/${selectedQuery.id}`,
+          queryData
+        );
+        setQueries(queries.map(q => q.id === updatedQuery.id ? updatedQuery : q));
+        setSelectedQuery(updatedQuery);
+        context.showNotification?.('Query saved successfully', 'success');
+      } else {
+        const newQuery = await apiClient.post<SparqlQuery>(
+          `/api/sparql/${projectId}/queries`,
+          queryData
+        );
+        setQueries([...queries, newQuery]);
+        setSelectedQuery(newQuery);
+        context.showNotification?.('Query created successfully', 'success');
+      }
+    } catch (err) {
+      setError('Failed to save query');
+      console.error('Failed to save query:', err);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDeleteQuery = async () => {
+    if (!selectedQuery) return;
+    setShowDeleteModal(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!selectedQuery) return;
+    setShowDeleteModal(false);
+    
+    try {
+      await apiClient.delete(`/api/sparql/${projectId}/queries/${selectedQuery.id}`);
+      setQueries(queries.filter(q => q.id !== selectedQuery.id));
+      handleNewQuery();
+      context.showNotification?.('Query deleted', 'info');
+    } catch (error) {
+      setError('Failed to delete query');
+      console.error('Failed to delete query:', error);
+    }
+  };
+
+  const saveBlob = (content: string, mime: string, filename: string) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const baseName = () => queryName.replace(/\s+/g, '_') || 'query-results';
+
+  const handleExecuteQuery = async (formatOverride?: GraphFormat, refresh = false) => {
+    const form = detectQueryForm(queryText);
+    if (form === 'update') {
+      setError(UPDATE_HINT);
+      return;
+    }
+    const format = formatOverride ?? graphFormat;
+    const computeFirst = activeMode === 'inferred' && needsCompute(status);
+    setIsLoading(true);
+    setComputing(computeFirst || (refresh && activeMode === 'inferred'));
+    clearResults();
+    setError(null);
+    setConflict(null);
+
+    try {
+      const base: { query: string; format?: GraphFormat; pageSize?: number } = { query: queryText };
+      if (isGraphForm(form)) base.format = format;
+      if (form === 'select') base.pageSize = pageSize;
+      const body = buildRequestBody(base, activeMode, refresh || computeFirst);
+      const response = await apiClient.post<any>(
+        `/api/sparql/query/${projectId}${draftMode ? '?draft=true' : ''}`,
+        body
+      );
+      const answeredConflict = mapConflict(response);
+      if (answeredConflict) {
+        setConflict(answeredConflict);
+        setActiveTab('editor');
+        return;
+      }
+      if (response?.error) {
+        setError(response.error);
+        return;
+      }
+      setInferredInfo(usedInferred(response));
+      const executionTime = response?.executionTime;
+      if (response?.type === 'graph') {
+        setGraphResult({
+          format: (response.format as GraphFormat) || format,
+          content: typeof response.content === 'string' ? response.content : '',
+          tripleCount: typeof response.tripleCount === 'number' ? response.tripleCount : undefined,
+          truncated: response.truncated === true,
+          executionTime
+        });
+      } else if (response?.type === 'boolean') {
+        setBooleanResult({ value: response.boolean === true, executionTime });
+      } else {
+        const rows = normalizeRows(response);
+        const vars: string[] = Array.isArray(response?.head?.vars)
+          ? response.head.vars
+          : Array.from(new Set(rows.flatMap(r => Object.keys(r))));
+        const next = resultsMeta(response, rows.length);
+        if (next.runId) {
+          setServerPage({
+            key: pageKey(next.runId, '', null, 0, pageSize),
+            rows,
+            filtered: typeof response?.filteredRows === 'number' ? response.filteredRows : rows.length
+          });
+        }
+        setMeta(next);
+        setResults({ head: { vars }, results: { bindings: rows }, executionTime });
+      }
+      setActiveTab('results');
+    } catch (err: any) {
+      const thrownConflict = mapConflict(err);
+      if (thrownConflict) {
+        setConflict(thrownConflict);
+        setActiveTab('editor');
+      } else {
+        setError(err?.message || 'Failed to execute query');
+        console.error('Failed to execute SPARQL query:', err);
+      }
+    } finally {
+      setIsLoading(false);
+      setComputing(false);
+      refreshStatus();
+    }
+  };
+
+  const handleGraphFormatChange = (format: GraphFormat) => {
+    setGraphFormat(format);
+    handleExecuteQuery(format);
+  };
+
+  const handleCopyResults = () => {
+    let text = '';
+    if (graphResult) {
+      text = graphResult.content;
+    } else if (results) {
+      text = toTsv(buildExportTable(results.head.vars, pageRows, includeTypes));
+    } else {
+      return;
+    }
+
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const exportRows = async (): Promise<TermRow[]> => {
+    if (!results) return [];
+    if (runId) {
+      const res = await apiClient.get<any>(
+        rowsPath(projectId, runId, { offset: 0, limit: 1, filter: filterTerm, sort, exportAll: true })
+      );
+      const rows = normalizeRows(res);
+      const note = exportNote(rows.length, typeof res?.filteredRows === 'number' ? res.filteredRows : rows.length);
+      setPageNote(note ?? '');
+      return rows;
+    }
+    return sortRows(filterRows(results.results.bindings, results.head.vars, filterTerm), sort);
+  };
+
+  const exportFailed = (error: any, what: string) => {
+    if (error?.status === 410) {
+      setExpired(true);
+      context.showNotification?.(EXPIRED_MESSAGE, 'warning');
+      return;
+    }
+    console.error(`${what} download failed:`, error);
+    context.showNotification?.(`Failed to download ${what}`, 'error');
+  };
+
+  const downloadCsv = async () => {
+    if (!results) return;
+
+    try {
+      const csv = toCsv(buildExportTable(results.head.vars, await exportRows(), includeTypes));
+      saveBlob(csv, 'text/csv;charset=utf-8;', `${baseName()}.csv`);
+      context.showNotification?.('CSV downloaded successfully', 'success');
+    } catch (error) {
+      exportFailed(error, 'CSV');
+    }
+  };
+
+  const downloadTsv = async () => {
+    if (!results) return;
+
+    try {
+      const tsv = toTsv(buildExportTable(results.head.vars, await exportRows(), includeTypes), true);
+      saveBlob(tsv, 'text/tab-separated-values;charset=utf-8;', `${baseName()}.tsv`);
+      context.showNotification?.('TSV downloaded successfully', 'success');
+    } catch (error) {
+      exportFailed(error, 'TSV');
+    }
+  };
+
+  const downloadJson = async () => {
+    if (!results) return;
+
+    try {
+      const out = {
+        ...results,
+        results: { bindings: buildJsonBindings(results.head.vars, await exportRows(), includeTypes) }
+      };
+      saveBlob(JSON.stringify(out, null, 2), 'application/json', `${baseName()}.json`);
+      context.showNotification?.('JSON downloaded successfully', 'success');
+    } catch (error) {
+      exportFailed(error, 'JSON');
+    }
+  };
+
+  const downloadGraph = () => {
+    if (!graphResult) return;
+
+    try {
+      const meta = GRAPH_FORMATS.find(f => f.value === graphResult.format) ?? GRAPH_FORMATS[0];
+      saveBlob(graphResult.content, `${meta.mime};charset=utf-8;`, `${baseName()}.${meta.ext}`);
+      context.showNotification?.(`${meta.label} downloaded successfully`, 'success');
+    } catch (error) {
+      console.error('Graph download failed:', error);
+      context.showNotification?.('Failed to download results', 'error');
+    }
+  };
+
+  const handleResetHeight = () => setResultsHeight(null);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizing(true);
+  };
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      e.preventDefault();
+      const panelTop = resultsPanelRef.current?.getBoundingClientRect().top ?? 0;
+      const areaHeight = resultsAreaRef.current?.getBoundingClientRect().height ?? window.innerHeight;
+      setResultsHeight(nextResultsHeight(e.clientY, panelTop, areaHeight - RESULTS_AREA_RESERVED));
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isResizing]);
+
+  const prefixBlock = prefixes.length > 0 
+    ? prefixes.map(p => `PREFIX ${p.prefix}: <${p.namespace}>`).join('\n')
+    : 'PREFIX owl: <http://www.w3.org/2002/07/owl#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>';
+
+  return (
+    <div className="h-full flex flex-col" style={{ backgroundColor: 'var(--bg)', color: 'var(--text-primary)' }}>
+      <header
+        className="px-4 py-3 border-b flex items-center justify-between"
+        style={{ backgroundColor: 'var(--surface-1)', borderColor: 'var(--border)' }}
+      >
+        <div className="flex items-center gap-3">
+          <Database className="w-6 h-6 text-accent" />
+          <div>
+            <h1 className="text-lg font-bold text-primary">SPARQL Query Editor</h1>
+            <p className="text-xs text-secondary">Execute SPARQL queries against your ontology</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <select
+            value={selectedSample}
+            onChange={(e) => {
+              const selectedValue = e.target.value;
+              setSelectedSample(selectedValue);
+              const sample = SAMPLE_QUERIES.find(s => s.name === selectedValue);
+              if (sample) {
+                handleLoadSample(sample);
+              }
+            }}
+            className="text-sm rounded px-2 py-1.5 theme-input"
+          >
+            <option value="">Load sample query...</option>
+            {SAMPLE_QUERIES.map((s, i) => (
+              <option key={i} value={s.name}>{s.name}</option>
+            ))}
+          </select>
+        </div>
+      </header>
+
+      <div ref={mainAreaRef} className="flex flex-1 overflow-hidden">
+        <aside className="w-72 bg-theme-surface border-r border-default flex flex-col">
+          <div className="p-2 border-b border-default">
+            <button
+              onClick={handleNewQuery}
+              className="w-full flex items-center justify-center gap-2 text-sm px-3 py-2 rounded-md transition-all"
+              style={{ backgroundColor: '#8b5cf6', color: '#ffffff' }}
+              onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#7c3aed')}
+              onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = '#8b5cf6')}
+            >
+              <Plus size={16} /> New Query
+            </button>
+          </div>
+          
+          <div className="p-2 border-b border-default">
+            <div className="text-xs font-semibold text-tertiary uppercase tracking-wider">
+              Saved Queries ({queries.length})
+            </div>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto">
+            {queries.length === 0 ? (
+              <div className="p-4 text-center text-sm text-tertiary">
+                No saved queries yet
+              </div>
+            ) : (
+              queries.map(query => (
+                <div
+                  key={query.id}
+                  onClick={() => handleSelectQuery(query)}
+                  style={{
+                    borderLeftColor: selectedQuery?.id === query.id ? '#8b5cf6' : 'transparent',
+                    backgroundColor: selectedQuery?.id === query.id ? 'var(--accent-tint)' : 'transparent'
+                  }}
+                  className="p-3 cursor-pointer border-b border-l-4 transition-all"
+                  onMouseEnter={(e) => {
+                    if (selectedQuery?.id !== query.id) {
+                      e.currentTarget.style.backgroundColor = 'var(--hover-overlay)';
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (selectedQuery?.id !== query.id) {
+                      e.currentTarget.style.backgroundColor = 'transparent';
+                    }
+                  }}
+                >
+                  <div className="text-sm font-medium" style={{ color: selectedQuery?.id === query.id ? '#8b5cf6' : 'var(--text-primary)' }}>
+                    {query.name}
+                  </div>
+                  <div className="text-xs text-tertiary truncate font-mono mt-1">
+                    {query.queryText.substring(0, 50)}...
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </aside>
+
+        <main className="flex-1 flex flex-col overflow-hidden min-h-0">
+          <div className="flex border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-1)' }}>
+            <button
+              onClick={() => setActiveTab('editor')}
+              className="px-4 py-3 text-sm font-medium border-b-2 transition-colors"
+              style={{
+                borderBottomColor: activeTab === 'editor' ? '#8b5cf6' : 'transparent',
+                color: activeTab === 'editor' ? '#8b5cf6' : 'var(--text-secondary)',
+                backgroundColor: activeTab === 'editor' ? 'var(--surface-2)' : 'transparent'
+              }}
+            >
+              <Code size={16} className="inline mr-2" />
+              Editor
+            </button>
+            <button
+              onClick={() => setActiveTab('results')}
+              className="px-4 py-3 text-sm font-medium border-b-2 transition-colors"
+              style={{
+                borderBottomColor: activeTab === 'results' ? '#8b5cf6' : 'transparent',
+                color: activeTab === 'results' ? '#8b5cf6' : 'var(--text-secondary)',
+                backgroundColor: activeTab === 'results' ? 'var(--surface-2)' : 'transparent'
+              }}
+            >
+              <Table size={16} className="inline mr-2" />
+              Results {results && `(${results.results.bindings.length})`}
+            </button>
+          </div>
+
+          {activeTab === 'editor' && (
+          <div className="flex-1 min-h-0 overflow-auto p-4">
+          <div className="theme-panel rounded-lg p-4 space-y-3">
+            <input
+              type="text"
+              value={queryName}
+              onChange={(e) => setQueryName(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg text-lg font-semibold theme-input"
+              placeholder="Query Name"
+            />
+
+            <div className="border border-default rounded-lg overflow-hidden">
+              <button
+                onClick={() => setPrefixesVisible(!isPrefixesVisible)}
+                className="w-full flex items-center justify-between p-2 text-xs font-medium text-secondary hover-overlay transition-colors"
+                style={{ backgroundColor: 'var(--surface-2)' }}
+              >
+                <span className="flex items-center gap-2">
+                  <Code size={14} />
+                  Ontology Prefixes
+                </span>
+                {isPrefixesVisible ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              </button>
+              {isPrefixesVisible && (
+                <div className="p-2 border-t border-default max-h-48 overflow-y-auto" style={{ backgroundColor: 'var(--surface-1)' }}>
+                  <pre className="text-xs text-primary font-mono whitespace-pre-wrap">
+                    {prefixBlock}
+                  </pre>
+                </div>
+              )}
+            </div>
+
+            <textarea
+              className="w-full h-48 p-3 font-mono text-sm rounded-lg theme-input resize-none"
+              value={queryText}
+              onChange={(e) => setQueryText(e.target.value)}
+              placeholder="Enter SPARQL query..."
+              spellCheck={false}
+            />
+
+            {isUpdate && (
+              <div
+                className="p-3 border rounded-lg text-sm"
+                style={{ borderColor: 'var(--warning, #f59e0b)', backgroundColor: 'var(--surface-2)' }}
+              >
+                {UPDATE_HINT}
+              </div>
+            )}
+
+            {isLoading && computing && (
+              <div data-testid="computing-inferred" className="p-3 border rounded-lg text-sm flex items-center gap-2" style={{ backgroundColor: 'var(--surface-2)' }}>
+                <Loader2 size={16} className="animate-spin" />
+                <span>{COMPUTING_TEXT}</span>
+              </div>
+            )}
+
+            {conflict?.kind === 'needsReasoning' && (
+              <div
+                data-testid="needs-reasoning-panel"
+                className="p-3 border rounded-lg text-sm space-y-2"
+                style={{ borderColor: 'var(--warning, #f59e0b)', backgroundColor: 'var(--surface-2)' }}
+              >
+                <div>{conflict.message}</div>
+                <div className="flex items-center gap-2">
+                  {canRefresh(conflict.reason) && (
+                    <button
+                      onClick={() => handleExecuteQuery(undefined, true)}
+                      disabled={isLoading}
+                      className="px-3 py-1.5 text-xs rounded-lg btn-outline disabled:opacity-50"
+                    >
+                      Run again with refresh
+                    </button>
+                  )}
+                  <button
+                    onClick={() => { chooseMode('asserted'); setConflict(null); }}
+                    className="px-3 py-1.5 text-xs rounded-lg btn-outline"
+                  >
+                    Switch to asserted only
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {conflict?.kind === 'inconsistent' && (
+              <div
+                data-testid="inconsistent-panel"
+                className="p-3 border rounded-lg text-sm space-y-1"
+                style={{ borderColor: 'var(--error)', backgroundColor: 'var(--surface-2)' }}
+              >
+                <div className="font-semibold text-error">The ontology is inconsistent</div>
+                <div>{conflict.message}</div>
+                {conflict.explanation && <div className="text-xs text-secondary whitespace-pre-wrap">{conflict.explanation}</div>}
+                <div className="text-xs text-secondary">No results are shown. Fix the inconsistency, or switch to asserted only.</div>
+                <button
+                  onClick={() => { chooseMode('asserted'); setConflict(null); }}
+                  className="px-3 py-1.5 text-xs rounded-lg btn-outline"
+                >
+                  Switch to asserted only
+                </button>
+              </div>
+            )}
+
+            {error && (
+              <div
+                className="p-3 border rounded-lg text-sm text-error"
+                style={{ borderColor: 'var(--error)', backgroundColor: 'var(--surface-2)' }}
+              >
+                {error}
+              </div>
+            )}
+
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleDeleteQuery}
+                  disabled={!selectedQuery}
+                  className="flex items-center gap-1 px-3 py-2 text-sm rounded-lg border border-default hover-overlay text-error disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  title={selectedQuery ? 'Delete query' : 'Select a query to delete'}
+                >
+                  <Trash2 size={16} />
+                </button>
+                <button
+                  onClick={() => fetchQueries()}
+                  className="flex items-center gap-1 px-3 py-2 text-sm rounded-lg btn-outline transition-colors"
+                  title="Refresh saved queries"
+                >
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <div className="relative flex items-center gap-1">
+                  <div
+                    role="group"
+                    aria-label="Data searched"
+                    title={switchInfo.tooltip}
+                    className="flex rounded-lg border border-default overflow-hidden"
+                  >
+                    <button
+                      type="button"
+                      aria-pressed={activeMode === 'asserted'}
+                      onClick={() => chooseMode('asserted')}
+                      className={`px-3 py-1.5 text-xs transition-colors ${activeMode === 'asserted' ? 'btn-tonal' : 'text-secondary hover-overlay'}`}
+                    >
+                      Asserted only
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={activeMode === 'inferred'}
+                      disabled={switchInfo.disabled}
+                      title={switchInfo.tooltip}
+                      onClick={() => chooseMode('inferred')}
+                      className={`px-3 py-1.5 text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${activeMode === 'inferred' ? 'btn-tonal' : 'text-secondary hover-overlay'}`}
+                    >
+                      Include inferred
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowIncluded(v => !v)}
+                    aria-expanded={showIncluded}
+                    className="px-2 py-1 text-xs text-secondary hover-overlay rounded"
+                  >
+                    What is included
+                  </button>
+                  {showIncluded && (
+                    <div
+                      data-testid="included-popover"
+                      className="absolute right-0 bottom-full mb-2 w-72 p-3 rounded-lg border border-default text-xs space-y-2 z-10"
+                      style={{ backgroundColor: 'var(--surface-1)' }}
+                    >
+                      <div className="font-semibold">Included</div>
+                      <ul className="list-disc pl-4">
+                        {INCLUDED_ITEMS.map(item => <li key={item}>{item}</li>)}
+                      </ul>
+                      <div className="font-semibold">Not included</div>
+                      <ul className="list-disc pl-4">
+                        {NOT_INCLUDED_ITEMS.map(item => <li key={item}>{item}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={handleSaveQuery}
+                  disabled={isSaving}
+                  className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg btn-outline disabled:opacity-50 transition-colors"
+                >
+                  {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                  Save
+                </button>
+                <button
+                  onClick={() => handleExecuteQuery()}
+                  disabled={isLoading || !queryText.trim() || isUpdate}
+                  className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                  style={{ backgroundColor: '#8b5cf6', color: '#ffffff' }}
+                  onMouseEnter={(e) => !isLoading && (e.currentTarget.style.backgroundColor = '#7c3aed')}
+                  onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = '#8b5cf6')}
+                >
+                  {isLoading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
+                  Execute
+                </button>
+              </div>
+            </div>
+          </div>
+            </div>
+          )}
+
+          {activeTab === 'results' && (
+          <div ref={resultsAreaRef} className="flex-1 min-h-0 overflow-hidden p-4 flex flex-col">
+          <div ref={resultsPanelRef} data-testid="results-panel" className={`theme-panel rounded-lg overflow-hidden flex flex-col min-h-0 ${resultsHeight === null ? 'flex-1' : 'flex-none'}`} style={resultsHeight === null ? { minHeight: `${MIN_RESULTS_HEIGHT}px` } : { height: `${resultsHeight}px`, minHeight: `${MIN_RESULTS_HEIGHT}px` }}>
+
+            <div className="flex items-center justify-between p-3 border-b border-default" style={{ backgroundColor: 'var(--surface-2)' }}>
+              <div className="flex items-center gap-4">
+                <span className="text-sm font-semibold text-primary flex items-center gap-2">
+                  <Table size={16} />
+                  Query Results
+                </span>
+                {hasOutcome && (
+                  <>
+                    {results && (
+                      <span className="text-xs text-tertiary" data-testid="results-line">
+                        {meta ? resultsLine(meta) : `${results.results.bindings.length} rows`}
+                      </span>
+                    )}
+                    {graphResult && graphResult.tripleCount !== undefined && !graphResult.truncated && (
+                      <span className="text-xs text-tertiary">
+                        {graphResult.tripleCount} triples
+                      </span>
+                    )}
+                    {(results?.executionTime ?? graphResult?.executionTime ?? booleanResult?.executionTime) !== undefined && (
+                      <span
+                        className="text-xs px-2 py-0.5 rounded-full font-medium"
+                        style={{ backgroundColor: 'var(--success-tint)', color: 'var(--success)' }}
+                      >
+                        {results?.executionTime ?? graphResult?.executionTime ?? booleanResult?.executionTime}ms
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
+              
+              {graphResult && (
+                <div className="flex items-center gap-2">
+                  <select
+                    aria-label="Result format"
+                    value={graphResult.format}
+                    onChange={(e) => handleGraphFormatChange(e.target.value as GraphFormat)}
+                    disabled={isLoading}
+                    className="text-xs rounded px-2 py-1 theme-input"
+                  >
+                    {GRAPH_FORMATS.map(f => (
+                      <option key={f.value} value={f.value}>{f.label}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleCopyResults}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Copy to clipboard"
+                  >
+                    {copied ? <Check size={14} style={{ color: 'var(--success)' }} /> : <Copy size={14} />}
+                  </button>
+                  <button
+                    onClick={downloadGraph}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Download results"
+                  >
+                    <Download size={14} /> Download
+                  </button>
+                </div>
+              )}
+
+              {results && (
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center gap-1 text-xs text-secondary" title="Add datatype and language columns to CSV, TSV, JSON and copy">
+                    <input
+                      type="checkbox"
+                      checked={includeTypes}
+                      onChange={(e) => setIncludeTypes(e.target.checked)}
+                    />
+                    Include datatype and language
+                  </label>
+                  <div className="flex rounded-lg border border-default overflow-hidden">
+                    <button
+                      onClick={() => setActiveResultTab('table')}
+                      className={`px-3 py-1 text-xs transition-colors ${
+                        activeResultTab === 'table' ? 'btn-tonal' : 'text-secondary hover-overlay'
+                      }`}
+                      style={{ backgroundColor: activeResultTab === 'table' ? undefined : 'var(--surface-1)' }}
+                    >
+                      Table
+                    </button>
+                    <button
+                      onClick={() => setActiveResultTab('json')}
+                      className={`px-3 py-1 text-xs transition-colors ${
+                        activeResultTab === 'json' ? 'btn-tonal' : 'text-secondary hover-overlay'
+                      }`}
+                      style={{ backgroundColor: activeResultTab === 'json' ? undefined : 'var(--surface-1)' }}
+                    >
+                      JSON
+                    </button>
+                  </div>
+                  
+                  <button
+                    onClick={handleCopyResults}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Copy this page to clipboard"
+                  >
+                    {copied ? <Check size={14} style={{ color: 'var(--success)' }} /> : <Copy size={14} />}
+                  </button>
+                  <button
+                    onClick={downloadCsv}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Download CSV"
+                  >
+                    <Download size={14} /> CSV
+                  </button>
+                  <button
+                    onClick={downloadTsv}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Download TSV"
+                  >
+                    <Download size={14} /> TSV
+                  </button>
+                  <button
+                    onClick={downloadJson}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-secondary hover-overlay rounded transition-colors"
+                    title="Download JSON"
+                  >
+                    <FileText size={14} /> JSON
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {inferredInfo && (
+              <div
+                data-testid="inferred-info"
+                className="px-3 py-2 text-xs border-b border-default space-y-1"
+                style={{ backgroundColor: 'var(--surface-1)' }}
+              >
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span>{infoLine(inferredInfo)}</span>
+                  {status?.stale && (
+                    <span
+                      data-testid="stale-badge"
+                      className="px-2 py-0.5 rounded-full font-medium"
+                      style={{ backgroundColor: 'var(--surface-2)', color: 'var(--warning, #f59e0b)' }}
+                    >
+                      Stale
+                    </span>
+                  )}
+                  {countsText(inferredInfo) && <span className="text-tertiary">{countsText(inferredInfo)}</span>}
+                </div>
+                {partialMessages(inferredInfo).length > 0 && (
+                  <div data-testid="partial-warning" style={{ color: 'var(--warning, #f59e0b)' }}>
+                    <div className="font-semibold">Partial results</div>
+                    <ul className="list-disc pl-4">
+                      {partialMessages(inferredInfo).map(m => <li key={m}>{m}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+              {isLoading ? (
+                <div className="flex items-center justify-center h-64 text-secondary">
+                  <Loader2 size={24} className="animate-spin mr-2" />
+                  <span>Executing query...</span>
+                </div>
+              ) : graphResult ? (
+                <div className="flex flex-col flex-1 min-h-0">
+                  {graphResult.truncated && (
+                    <div className="p-2 text-xs border-b border-default" style={{ backgroundColor: 'var(--surface-2)' }}>
+                      Showing first {graphResult.tripleCount ?? ''} triples; the rest were cut off. Add a LIMIT or narrow the query.
+                    </div>
+                  )}
+                  <pre data-testid="graph-result" className="p-4 text-xs font-mono text-primary overflow-auto whitespace-pre-wrap flex-1">
+                    {graphResult.content}
+                  </pre>
+                </div>
+              ) : booleanResult ? (
+                <div className="flex items-center justify-center h-64">
+                  <span
+                    data-testid="boolean-result"
+                    className="text-lg font-semibold px-6 py-2 rounded-full"
+                    style={{
+                      backgroundColor: booleanResult.value ? 'var(--success-tint)' : 'var(--surface-2)',
+                      color: booleanResult.value ? 'var(--success)' : 'var(--error)'
+                    }}
+                  >
+                    {booleanResult.value ? 'true' : 'false'}
+                  </span>
+                </div>
+              ) : results ? (
+                <div className="flex flex-col flex-1 min-h-0">
+                  {notice && (
+                    <div className="p-2 text-xs border-b border-default" style={{ backgroundColor: 'var(--surface-2)' }} data-testid="truncation-notice">
+                      {notice}
+                    </div>
+                  )}
+                  <div className="p-2 flex flex-wrap items-center gap-2 text-xs border-b border-default" style={{ backgroundColor: 'var(--surface-1)' }}>
+                    <input
+                      type="search"
+                      value={filterInput}
+                      onChange={(e) => setFilterInput(e.target.value)}
+                      placeholder="Filter all columns"
+                      aria-label="Filter results"
+                      className="px-2 py-1 rounded text-xs theme-input"
+                    />
+                    {pageNote && <span className="text-xs" style={{ color: 'var(--warning, #f59e0b)' }} data-testid="page-note">{pageNote}</span>}
+                    <label className="ml-auto flex items-center gap-1 text-xs text-secondary">
+                      Rows per page
+                      <select
+                        value={pageSize}
+                        onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
+                        className="px-1 py-0.5 rounded text-xs theme-input"
+                        aria-label="Rows per page"
+                      >
+                        {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-auto">
+                    {activeResultTab === 'table' ? (
+                      <table className="min-w-full text-sm">
+                        <thead className="sticky top-0" style={{ backgroundColor: 'var(--surface-2)' }}>
+                          <tr>
+                            {results.head.vars.map((col) => (
+                              <th
+                                key={col}
+                                className="p-2 text-left font-semibold text-secondary border-b border-default cursor-pointer select-none"
+                                onClick={() => { setSort(nextSort(sort, col)); setPage(0); }}
+                                aria-sort={sort?.column === col ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+                              >
+                                ?{col}{sort?.column === col ? ` ${sortArrow(sort, col)}` : ''}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y" style={{ borderColor: 'var(--divider)' }}>
+                          {pageRows.map((binding, rowIndex) => (
+                            <tr key={safePage * pageSize + rowIndex} className="hover-overlay">
+                              {results.head.vars.map((col) => {
+                                const shown = formatTerm(binding[col], shortPrefixes);
+                                return (
+                                  <td key={col} className="p-2 text-primary font-mono text-xs">
+                                    <span title={shown.title ?? binding[col]?.value}>{shown.text}</span>
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <pre className="p-4 text-xs font-mono text-primary overflow-auto">
+                        {jsonText}
+                      </pre>
+                    )}
+                    {expired && (
+                      <div className="p-3 text-sm flex items-center gap-2 border-t border-default" data-testid="results-expired">
+                        {EXPIRED_MESSAGE}
+                        <button onClick={() => handleExecuteQuery()} className="px-2 py-1 rounded text-xs btn-outline">Run again</button>
+                      </div>
+                    )}
+                    {!expired && filteredCount === 0 && !pageLoading && (
+                      <div className="p-4 text-sm text-center text-tertiary">
+                        {meta && meta.storedRows > 0 ? 'No rows match the filter.' : 'The query returned no rows.'}
+                      </div>
+                    )}
+                  </div>
+                  <div className="p-2 flex flex-wrap items-center gap-2 text-xs border-t border-default" style={{ backgroundColor: 'var(--surface-1)' }}>
+                    <span data-testid="results-showing">
+                      {pageLoading ? 'Loading page...' : showingText(filteredCount, meta?.storedRows ?? results.results.bindings.length, safePage, pageSize)}
+                    </span>
+                    <span className="ml-auto flex items-center gap-1">
+                      <button onClick={() => setPage(0)} disabled={safePage === 0} className="px-2 py-1 rounded btn-outline disabled:opacity-50" aria-label="First page">First</button>
+                      <button onClick={() => setPage(safePage - 1)} disabled={safePage === 0} className="px-2 py-1 rounded btn-outline disabled:opacity-50">Previous</button>
+                      <button onClick={() => setPage(safePage + 1)} disabled={safePage >= lastPage} className="px-2 py-1 rounded btn-outline disabled:opacity-50">Next</button>
+                      <button onClick={() => setPage(lastPage)} disabled={safePage >= lastPage} className="px-2 py-1 rounded btn-outline disabled:opacity-50" aria-label="Last page">Last</button>
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center h-64 text-tertiary">
+                  <div className="text-center">
+                    <Database size={48} className="mx-auto mb-4 opacity-50" />
+                    <p>Query results will appear here</p>
+                    <p className="text-xs mt-1">Write a SPARQL query and click Execute</p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+          
+          <div 
+            data-testid="results-resize-handle"
+            onMouseDown={handleMouseDown}
+            onDoubleClick={handleResetHeight}
+            title="Drag to resize, double-click to fill"
+            className="h-2 shrink-0 cursor-row-resize hover:bg-purple-500/20 transition-colors flex items-center justify-center"
+            style={{ borderTop: '1px solid var(--border)' }}
+          >
+            <div className="w-12 h-1 bg-gray-400 rounded-full"></div>
+          </div>
+          </div>
+          )}
+        </main>
+      </div>
+
+      {showDeleteModal && (
+        <div
+          className="fixed inset-0 flex items-center justify-center z-50 p-4"
+          style={{ backgroundColor: 'var(--overlay)' }}
+        >
+          <div className="theme-panel rounded-lg p-6 max-w-md w-full shadow-xl max-h-[80vh] overflow-auto">
+            <h3 className="text-lg font-semibold text-primary mb-2">Delete Query</h3>
+            <p className="text-secondary mb-6">
+              Are you sure you want to delete "{selectedQuery?.name}"? This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowDeleteModal(false)}
+                className="px-4 py-2 text-sm rounded-lg btn-outline transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="px-4 py-2 text-sm rounded-lg hover-brightness transition-colors"
+                style={{ backgroundColor: 'var(--error)', color: 'var(--on-error)' }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default SparqlQueryEditor;
